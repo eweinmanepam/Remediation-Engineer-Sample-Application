@@ -1,0 +1,60 @@
+services:
+  web:
+    build: ./web
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+      - fauxpay
+
+  api:
+    build: ./api
+    env_file: .env
+    environment:
+      DB_HOST: db
+      FAUXPAY_BASE_URL: http://fauxpay:4000
+    depends_on:
+      db:
+        condition: service_healthy
+      fauxpay:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+    expose:
+      - "3000"
+
+  migrate:
+    build: ./api
+    command: ["npm", "run", "migrate"]
+    env_file: .env
+    environment:
+      DB_HOST: db
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${DB_NAME:-widgetshop}
+      POSTGRES_USER: ${DB_USER:-widgetshop}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-widgetshop}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-widgetshop}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    expose:
+      - "5432"
+
+  fauxpay:
+    build: ./fauxpay
+    environment:
+      FAUXPAY_API_KEY: ${FAUXPAY_API_KEY:-fauxpay_test_key}
+    expose:
+      - "4000"
+
+volumes:
+  db_data:
