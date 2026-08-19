@@ -49,41 +49,94 @@ export default function Checkout() {
   return (
     <div>
       <h1>Checkout</h1>
-      <p>Subtotal: ${(cart.subtotal_cents / 100).toFixed(2)}</p>
+
+      <div className="card" style={{ marginBottom: '1.5rem', maxWidth: 480 }}>
+        <div className="cart-summary" style={{ borderTop: 'none', marginTop: 0, paddingTop: 0 }}>
+          <span>Order subtotal</span>
+          <span className="total">${(cart.subtotal_cents / 100).toFixed(2)}</span>
+        </div>
+      </div>
 
       <h2>Shipping address</h2>
-      {addresses.length > 0 && (
-        <select value={addressId} onChange={(e) => setAddressId(e.target.value)}>
-          {addresses.map((a) => (
-            <option key={a.id} value={a.id}>
-              {a.line1}, {a.city}
-            </option>
-          ))}
-        </select>
-      )}
-      <details>
-        <summary>Add a new address</summary>
-        <form onSubmit={(e) => e.preventDefault()}>
-          <input placeholder="Address line 1" value={newAddress.line1} onChange={(e) => setNewAddress({ ...newAddress, line1: e.target.value })} />
-          <input placeholder="City" value={newAddress.city} onChange={(e) => setNewAddress({ ...newAddress, city: e.target.value })} />
-          <input placeholder="State" value={newAddress.state} onChange={(e) => setNewAddress({ ...newAddress, state: e.target.value })} />
-          <input placeholder="Postal code" value={newAddress.postal_code} onChange={(e) => setNewAddress({ ...newAddress, postal_code: e.target.value })} />
-          <input placeholder="Country" value={newAddress.country} onChange={(e) => setNewAddress({ ...newAddress, country: e.target.value })} />
-          <button type="button" onClick={saveAddress}>Save address</button>
-        </form>
-      </details>
+      <div className="card" style={{ maxWidth: 480 }}>
+        {addresses.length > 0 && (
+          <select value={addressId} onChange={(e) => setAddressId(e.target.value)} style={{ marginBottom: '1rem' }}>
+            {addresses.map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.line1}, {a.city}
+              </option>
+            ))}
+          </select>
+        )}
+        <details>
+          <summary>Add a new address</summary>
+          <form onSubmit={(e) => e.preventDefault()}>
+            <input
+              placeholder="Address line 1"
+              value={newAddress.line1}
+              onChange={(e) => setNewAddress({ ...newAddress, line1: e.target.value })}
+            />
+            <input placeholder="City" value={newAddress.city} onChange={(e) => setNewAddress({ ...newAddress, city: e.target.value })} />
+            <input
+              placeholder="State"
+              value={newAddress.state}
+              onChange={(e) => setNewAddress({ ...newAddress, state: e.target.value })}
+            />
+            <input
+              placeholder="Postal code"
+              value={newAddress.postal_code}
+              onChange={(e) => setNewAddress({ ...newAddress, postal_code: e.target.value })}
+            />
+            <input
+              placeholder="Country"
+              value={newAddress.country}
+              onChange={(e) => setNewAddress({ ...newAddress, country: e.target.value })}
+            />
+            <button type="button" className="secondary" onClick={saveAddress}>
+              Save address
+            </button>
+          </form>
+        </details>
+      </div>
 
-      <h2>Payment (FauxPay — test data only, not a real processor)</h2>
-      <form onSubmit={submit}>
-        <input placeholder="Card number" value={card.card_number} onChange={(e) => setCard({ ...card, card_number: e.target.value })} />
-        <input placeholder="Exp month (MM)" value={card.exp_month} onChange={(e) => setCard({ ...card, exp_month: e.target.value })} />
-        <input placeholder="Exp year (YYYY)" value={card.exp_year} onChange={(e) => setCard({ ...card, exp_year: e.target.value })} />
-        <input placeholder="CVV" value={card.cvv} onChange={(e) => setCard({ ...card, cvv: e.target.value })} />
-        {error && <p className="error">{error}</p>}
-        <button type="submit" disabled={submitting}>
-          {submitting ? 'Placing order...' : 'Place order'}
-        </button>
-      </form>
+      <h2>Payment</h2>
+      <p className="helper-text" style={{ marginTop: '-0.5rem' }}>
+        Processed by FauxPay — a fictional payment processor for this training environment. Use test card
+        4242 4242 4242 4242.
+      </p>
+      <div className="card" style={{ maxWidth: 480 }}>
+        <form onSubmit={submit}>
+          <input
+            placeholder="Card number"
+            value={card.card_number}
+            onChange={(e) => setCard({ ...card, card_number: e.target.value })}
+          />
+          <div style={{ display: 'flex', gap: '0.5rem' }}>
+            <input
+              placeholder="MM"
+              value={card.exp_month}
+              onChange={(e) => setCard({ ...card, exp_month: e.target.value })}
+              style={{ width: '4rem' }}
+            />
+            <input
+              placeholder="YYYY"
+              value={card.exp_year}
+              onChange={(e) => setCard({ ...card, exp_year: e.target.value })}
+              style={{ width: '5rem' }}
+            />
+            <input
+              placeholder="CVV"
+              value={card.cvv}
+              onChange={(e) => setCard({ ...card, cvv: e.target.value })}
+              style={{ width: '4.5rem' }}
+            />
+          </div>
+          {error && <p className="error">{error}</p>}
+          <button type="submit" disabled={submitting}>
+            {submitting ? 'Placing order...' : `Pay $${(cart.subtotal_cents / 100).toFixed(2)}`}
+          </button>
+        </form>
+      </div>
     </div>
   );
 }

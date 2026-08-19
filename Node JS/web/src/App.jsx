@@ -1,5 +1,7 @@
-import { Routes, Route, Link, Navigate } from 'react-router-dom';
+import { useEffect, useState } from 'react';
+import { Routes, Route, Link, NavLink, Navigate } from 'react-router-dom';
 import { useAuth } from './AuthContext';
+import { api } from './api/client';
 import Catalog from './pages/Catalog';
 import WidgetDetail from './pages/WidgetDetail';
 import Cart from './pages/Cart';
@@ -17,51 +19,124 @@ function RequireRole({ roles, children }) {
   return children;
 }
 
+function navLinkClass({ isActive }) {
+  return isActive ? 'active' : undefined;
+}
+
+function initials(user) {
+  const source = user.full_name || user.email || '';
+  return source.slice(0, 1).toUpperCase();
+}
+
 export default function App() {
   const { user, logout, loading } = useAuth();
+  const [cartCount, setCartCount] = useState(0);
+
+  useEffect(() => {
+    if (!user) {
+      setCartCount(0);
+      return;
+    }
+    api
+      .cart()
+      .then((cart) => setCartCount(cart.items.reduce((sum, i) => sum + i.quantity, 0)))
+      .catch(() => setCartCount(0));
+  }, [user]);
 
   return (
-    <div>
-      <nav>
-        <Link to="/">Catalog</Link>
-        {user && <Link to="/cart">Cart</Link>}
-        {user && <Link to="/orders">My Orders</Link>}
-        {user?.role === 'admin' && <Link to="/admin">Admin</Link>}
-        {user?.role === 'customer_service' && <Link to="/cs">Customer Service</Link>}
-        {!loading && !user && <Link to="/login">Login</Link>}
-        {!loading && !user && <Link to="/register">Register</Link>}
-        {user && (
-          <button onClick={logout} style={{ marginLeft: '1rem' }}>
-            Log out ({user.email})
-          </button>
-        )}
-      </nav>
-      <hr />
-      <Routes>
-        <Route path="/" element={<Catalog />} />
-        <Route path="/widgets/:id" element={<WidgetDetail />} />
-        <Route path="/login" element={<Login />} />
-        <Route path="/register" element={<Register />} />
-        <Route path="/cart" element={<Cart />} />
-        <Route path="/checkout" element={<Checkout />} />
-        <Route path="/orders" element={<Orders />} />
-        <Route
-          path="/admin"
-          element={
-            <RequireRole roles={['admin']}>
-              <Admin />
-            </RequireRole>
-          }
-        />
-        <Route
-          path="/cs"
-          element={
-            <RequireRole roles={['customer_service']}>
-              <CustomerService />
-            </RequireRole>
-          }
-        />
-      </Routes>
+    <div className="app-shell">
+      <header className="site-header">
+        <div className="header-inner">
+          <Link to="/" className="brand">
+            <span className="brand-mark">W</span>
+            Widget Shop
+          </Link>
+
+          <nav className="main-nav">
+            <NavLink to="/" end className={navLinkClass}>
+              Catalog
+            </NavLink>
+            {user && (
+              <NavLink to="/orders" className={navLinkClass}>
+                My Orders
+              </NavLink>
+            )}
+            {user?.role === 'admin' && (
+              <NavLink to="/admin" className={navLinkClass}>
+                Admin
+              </NavLink>
+            )}
+            {user?.role === 'customer_service' && (
+              <NavLink to="/cs" className={navLinkClass}>
+                Customer Service
+              </NavLink>
+            )}
+          </nav>
+
+          <div className="header-actions">
+            {user && (
+              <Link to="/cart" className="cart-link">
+                Cart
+                {cartCount > 0 && <span className="cart-badge">{cartCount}</span>}
+              </Link>
+            )}
+            {!loading && !user && (
+              <>
+                <Link to="/login" className="btn secondary">
+                  Log in
+                </Link>
+                <Link to="/register" className="btn">
+                  Sign up
+                </Link>
+              </>
+            )}
+            {user && (
+              <div className="user-chip">
+                <span className="avatar">{initials(user)}</span>
+                <span>{user.full_name || user.email}</span>
+                <button className="logout-button" onClick={logout}>
+                  Log out
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      </header>
+
+      <main className="page-container">
+        <Routes>
+          <Route path="/" element={<Catalog />} />
+          <Route path="/widgets/:id" element={<WidgetDetail />} />
+          <Route path="/login" element={<Login />} />
+          <Route path="/register" element={<Register />} />
+          <Route path="/cart" element={<Cart />} />
+          <Route path="/checkout" element={<Checkout />} />
+          <Route path="/orders" element={<Orders />} />
+          <Route
+            path="/admin"
+            element={
+              <RequireRole roles={['admin']}>
+                <Admin />
+              </RequireRole>
+            }
+          />
+          <Route
+            path="/cs"
+            element={
+              <RequireRole roles={['customer_service']}>
+                <CustomerService />
+              </RequireRole>
+            }
+          />
+        </Routes>
+      </main>
+
+      <footer className="site-footer">
+        <div className="footer-inner">
+          <span>&copy; {new Date().getFullYear()} Widget Shop. For training purposes only.</span>
+          <span>Payments processed by FauxPay (fictional).</span>
+        </div>
+      </footer>
     </div>
   );
 }
