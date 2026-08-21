@@ -33,6 +33,7 @@ This document intentionally leaves some implementation details open (they are fi
 | Backend | Node.js API server (e.g. Express) |
 | Database | SQL (PostgreSQL or SQLite for local/dev) via an ORM/query builder |
 | Auth | Session- or JWT-based auth, password hashing (bcrypt/argon2) |
+| Email | Transactional email provider (SMTP relay or API), used to deliver password-reset links |
 | Payments | Real external payment processor (e.g. Stripe-style gateway), accessed over HTTPS via a thin client module |
 | Deployment | Docker containers, orchestrated via Docker Compose |
 
@@ -120,6 +121,7 @@ The full set of tables, columns, types, and foreign keys is captured in the ER d
 - **Carts**: one active cart per user (or session for guests, if guest carts are supported — otherwise require login before cart use).
 - **`cart_items.unit_price_cents`**: recommend **re-pricing at checkout** from `widgets.price_cents` rather than trusting a price snapshotted at add-time, to avoid stale-price abuse.
 - **`order_items.unit_price_cents`** is immutable once set — it is the price at time of purchase and is never affected by later catalog price changes.
+- **`password_reset_tokens`** are single-use and time-limited: a token is stored hashed (never plaintext), carries an `expires_at`, and is marked used (or deleted) the moment it's redeemed or superseded by a newer request.
 - **No table ever stores a full card number, CVV, or expiration date.** Only the processor's opaque token (`payments.processor_card_token`) and display metadata (`card_last4`, `card_brand`) are persisted, consistent with basic PCI-DSS scope reduction.
 
 ### 5.1 Proposed ER Diagram
@@ -131,6 +133,7 @@ erDiagram
     USERS ||--o{ ORDERS : places
     USERS ||--o{ REFUNDS : "issues (CS)"
     USERS ||--o{ EXCHANGES : "processes (CS)"
+    USERS ||--o{ PASSWORD_RESET_TOKENS : requests
 
     CATEGORIES ||--o{ WIDGETS : categorizes
     USERS ||--o{ WIDGETS : "created/updated by (admin)"
@@ -261,6 +264,15 @@ erDiagram
         timestamp created_at
         timestamp updated_at
     }
+
+    PASSWORD_RESET_TOKENS {
+        id id PK
+        id user_id FK
+        string token_hash
+        timestamp expires_at
+        timestamp used_at
+        timestamp created_at
+    }
 ```
 
 This diagram is a direct rendering of the tables and foreign keys defined above (§5); it does not introduce any structure not already specified there.
@@ -284,6 +296,19 @@ This integration surface is intentionally modeled on how real gateways work (cli
 ### 7.1 Registration / Login
 1. Guest submits email/password (+ name) → server hashes password, creates `users` row with role `customer`.
 2. Login validates credentials, issues session/JWT.
+
+### 7.1a Forgot / Reset Password
+1. Guest submits their email on a "forgot password" form.
+2. Server looks up the user; regardless of whether a match is found, it returns the same generic response (to avoid leaking which emails are registered).
+3. If a match is found, server generates a single-use, time-limited reset token, stores only its hash in `password_reset_tokens` (with `expires_at`), and emails a reset link containing the plaintext token to the user's registered email address via the transactional email provider.
+4. User follows the link, submits a new password (+ the token from the link).
+5. Server validates the token (exists, unexpired, unused), hashes the new password, updates `users.password_hash`, marks the token used, and invalidates the user's other active sessions.
+
+### 7.1b Change Password
+1. Authenticated customer submits their current password and a new password from their account settings.
+2. Server re-verifies the current password against `users.password_hash` before allowing the change (prevents a hijacked session with a stolen token/cookie, but no credentials, from silently taking over the account).
+3. On success: server hashes and stores the new password, and invalidates the user's other active sessions.
+4. On failure (current password incorrect): request rejected, password unchanged.
 
 ### 7.2 Browse Catalog
 - Public endpoint lists active widgets, filterable by category, searchable by name; widget detail view shows description/price/stock.
@@ -502,6 +527,83 @@ sequenceDiagram
     SPA-->>CS: Exchange completed
 ```
 
+### 7.7.7 Forgot / Reset Password (§7.1a)
+
+```mermaid
+sequenceDiagram
+    actor Guest
+    participant SPA
+    participant API
+    participant DB
+    participant Email as Email Provider
+
+    Guest->>SPA: Submit email ("forgot password")
+    SPA->>API: POST /api/auth/forgot-password {email}
+    API->>DB: SELECT user by email
+
+    alt user found
+        DB-->>API: user row
+        API->>API: Generate single-use token, hash it
+        API->>DB: INSERT password_reset_tokens {user_id, token_hash, expires_at}
+        DB-->>API: ack
+        API->>Email: Send reset link (plaintext token)
+        Email-->>Guest: Reset password email
+    else user not found
+        DB-->>API: no match
+        Note over API: No token generated
+    end
+
+    API-->>SPA: 200 OK (generic response either way)
+    SPA-->>Guest: "If that email exists, a reset link was sent"
+
+    Guest->>SPA: Open reset link, submit new password + token
+    SPA->>API: POST /api/auth/reset-password {token, new_password}
+    API->>DB: SELECT password_reset_tokens by token_hash
+    DB-->>API: token row
+
+    alt token valid (found, unexpired, unused)
+        API->>API: Hash new password
+        API->>DB: UPDATE users.password_hash
+        API->>DB: UPDATE password_reset_tokens SET used_at=now
+        API->>DB: Invalidate user's other active sessions
+        DB-->>API: ack
+        API-->>SPA: 200 OK (password reset)
+        SPA-->>Guest: Redirect to login
+    else token invalid/expired/used
+        API-->>SPA: 400 Bad Request
+        SPA-->>Guest: Show error, request a new link
+    end
+```
+
+### 7.7.8 Change Password (§7.1b)
+
+```mermaid
+sequenceDiagram
+    actor Customer
+    participant SPA
+    participant API
+    participant DB
+
+    Customer->>SPA: Submit current password + new password
+    SPA->>API: POST /api/auth/change-password {current_password, new_password}
+    API->>API: Check authenticated session
+    API->>DB: SELECT user by session/JWT subject
+    DB-->>API: user row (password_hash)
+    API->>API: Verify current_password against password_hash
+
+    alt current password correct
+        API->>API: Hash new password
+        API->>DB: UPDATE users.password_hash
+        API->>DB: Invalidate user's other active sessions
+        DB-->>API: ack
+        API-->>SPA: 200 OK (password changed)
+        SPA-->>Customer: Confirmation
+    else current password incorrect
+        API-->>SPA: 401/403 (incorrect current password)
+        SPA-->>Customer: Show error, password unchanged
+    end
+```
+
 ---
 
 ## 8. API Surface (representative, not exhaustive)
@@ -510,6 +612,9 @@ sequenceDiagram
 Auth
   POST   /api/auth/register
   POST   /api/auth/login
+  POST   /api/auth/forgot-password   (request reset link, always generic response)
+  POST   /api/auth/reset-password    (consume token, set new password)
+  POST   /api/auth/change-password   (authenticated, requires current password)
   POST   /api/auth/logout
 
 Catalog (public)
@@ -560,10 +665,12 @@ All non-public endpoints require authentication; role-restricted endpoints addit
 8. Customer Service agents can view any order, issue full/partial refunds with a reason, and process exchanges (return + replacement, with price-difference settlement).
 9. Every refund/exchange records who performed it and when (audit trail).
 10. Role-based access control is enforced on the backend for every state-changing operation.
+11. Users can request a password reset email and set a new password via a single-use, time-limited link, without revealing whether a given email is registered.
+12. Authenticated users can change their password by re-confirming their current password.
 
 ## 10. Non-Functional Requirements
 
-- **Security**: password hashing, parameterized SQL (no string-concatenated queries), server-side authZ on every endpoint, no raw card data at rest, HTTPS assumed in deployment.
+- **Security**: password hashing, parameterized SQL (no string-concatenated queries), server-side authZ on every endpoint, no raw card data at rest, HTTPS assumed in deployment. Password reset tokens are single-use, time-limited, stored hashed, and the forgot-password endpoint is rate-limited and returns a uniform response to avoid user enumeration.
 - **Data integrity**: order line items and prices are immutable once an order is placed; catalog price changes never retroactively alter past orders.
 - **Auditability**: refunds and exchanges record the acting staff user, timestamp, and reason.
 - **Testability**: the payment processor client is implemented behind an interface/module boundary so it can be pointed at the processor's sandbox/test mode, or replaced with a test double, for local development and automated tests — this is a testing concern and does not change the production architecture, which always talks to the real processor.
