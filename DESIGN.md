@@ -131,17 +131,17 @@ The full set of tables, columns, types, and foreign keys is captured in the ER d
 - **`refresh_tokens`** back the session/token-theft mitigations in §3.2: each row is a single-use, rotating refresh token stored hashed (never plaintext), with `expires_at` and `revoked_at`. Revoking a user's sessions (e.g. on password change) means setting `revoked_at` on their active rows here — the short-lived JWT access token itself is never persisted or revocable.
 - **No table ever stores a full card number, CVV, or expiration date.** Only the processor's opaque token (`payments.processor_card_token`) and display metadata (`card_last4`, `card_brand`) are persisted, consistent with basic PCI-DSS scope reduction.
 
-GitHub's Mermaid renderer reproducibly fails on these diagrams — first with "Unable to render rich display" on the original single 13-entity version, then with "svg element not in render tree" even after splitting it by domain. The second error is a known Mermaid text-measurement regression (mermaid-js/mermaid#4280) triggered by an entity whose attribute rows mix some with a quoted comment and some without — mermaid tries to measure an "empty" comment cell for the rows lacking one and the layout step throws. Every entity below used to have exactly that mix (e.g. `id id PK` alongside `enum role "customer, admin, customer_service"`). The fix is to give every attribute row a comment so none is implicitly empty. An entity listed without its column list in a diagram below is repeated only to anchor a cross-diagram relationship — its full definition lives in the diagram where it's the primary subject.
+The data model is presented as three diagrams grouped by domain — Users & Catalog, Orders & Fulfillment, and Auth & Session Security — so each stays focused and easy to read rather than one large, hard-to-follow schema. An entity referenced without its column list in a diagram below is shown there only to anchor a cross-diagram relationship; its full definition lives in the diagram where it's the primary subject.
 
 ### 5.1 Proposed ER Diagram — Users & Catalog
 
 ```mermaid
 erDiagram
-    USERS ||--o{ ADDRESSES : owns
-    USERS ||--o{ CARTS : owns
-    CATEGORIES ||--o{ WIDGETS : categorizes
+    USERS ||--o{ ADDRESSES : "owns"
+    USERS ||--o{ CARTS : "owns"
+    CATEGORIES ||--o{ WIDGETS : "categorizes"
     USERS ||--o{ WIDGETS : "created/updated by (admin)"
-    CARTS ||--o{ CART_ITEMS : contains
+    CARTS ||--o{ CART_ITEMS : "contains"
     WIDGETS ||--o{ CART_ITEMS : "referenced by"
 
     USERS {
@@ -208,11 +208,11 @@ erDiagram
 
 ```mermaid
 erDiagram
-    USERS ||--o{ ORDERS : places
+    USERS ||--o{ ORDERS : "places"
     USERS ||--o{ REFUNDS : "issues (CS)"
     USERS ||--o{ EXCHANGES : "processes (CS)"
     ADDRESSES ||--o{ ORDERS : "ships to"
-    ORDERS ||--o{ ORDER_ITEMS : contains
+    ORDERS ||--o{ ORDER_ITEMS : "contains"
     WIDGETS ||--o{ ORDER_ITEMS : "referenced by"
     ORDERS ||--o| PAYMENTS : "paid via"
     PAYMENTS ||--o{ REFUNDS : "refunded via"
@@ -283,7 +283,7 @@ The `password_reset_tokens` and `refresh_tokens` tables that back §3.2 and §7.
 
 ```mermaid
 erDiagram
-    USERS ||--o{ PASSWORD_RESET_TOKENS : requests
+    USERS ||--o{ PASSWORD_RESET_TOKENS : "requests"
     USERS ||--o{ REFRESH_TOKENS : "authenticates via"
 
     PASSWORD_RESET_TOKENS {
@@ -360,7 +360,7 @@ This integration surface is intentionally modeled on how real gateways work (cli
 
 1. Authenticated customer adds/updates/removes items in their cart.
 2. On checkout: customer supplies shipping address and card details (entered directly into a payment-processor-hosted field/component in the SPA → tokenized client-side).
-3. SPA sends `card_token` + cart + shipping address to backend `POST /orders`.
+3. SPA sends `card_token` + cart + shipping address to backend `POST /api/orders`.
 4. Backend re-prices cart from current `widgets.price_cents`, creates `orders` (status `pending_payment`) + `order_items`, calls the payment processor `/charge`.
 5. On success: create `payments` row, set order status `paid`, decrement `stock_quantity`, clear cart.
 6. On failure: order marked failed/cancelled, customer notified, cart preserved.
@@ -724,8 +724,8 @@ sequenceDiagram
         DB-->>API: token row
         API->>API: Generate new access token
         API->>API: Generate new opaque refresh token, hash it
-        API->>DB: INSERT new refresh_tokens row {replaces old id}
-        API->>DB: UPDATE old refresh_tokens SET revoked_at=now
+        API->>DB: INSERT new refresh_tokens row
+        API->>DB: UPDATE old refresh_tokens SET revoked_at=now, replaced_by=new row id
         DB-->>API: ack
         API-->>SPA: 200 OK, new access token in body + Set-Cookie refresh_token (rotated)
         SPA->>SPA: Replace in-memory access token
@@ -840,7 +840,7 @@ The **payment processor is not a container in this Compose stack** — it is a r
 
 ### 11.3 Configuration & Secrets
 
-- All service configuration (DB connection string, JWT/session secret, payment processor base URL/API key, port numbers) is supplied via environment variables, not hardcoded.
+- All service configuration (DB connection string, JWT signing secret, payment processor base URL/API key, port numbers) is supplied via environment variables, not hardcoded.
 - Local dev uses a `.env` file (excluded from version control via `.gitignore`); example values live in a committed `.env.example`.
 - Database credentials and any signing secrets are treated as secrets — for Compose-based deployment, env vars are acceptable; a larger-scale deployment would use Docker secrets or a secrets manager.
 
