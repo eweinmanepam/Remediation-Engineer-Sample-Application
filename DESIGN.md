@@ -461,7 +461,8 @@ sequenceDiagram
     API-->>SPA: 200/201 OK
     SPA-->>Admin: Catalog updated
 
-    Note over API,DB: Existing order_items.unit_price_cents are immutable;\nprice changes only affect future carts/orders.
+    Note over API,DB: Existing order_items.unit_price_cents are immutable
+    Note over API,DB: price changes only affect future carts/orders
 ```
 
 ### 7.7.5 Customer Service — Refunds (§7.5)
