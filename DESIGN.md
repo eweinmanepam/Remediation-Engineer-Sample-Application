@@ -127,7 +127,7 @@ Admin and CS accounts are internal/staff accounts, not self-service registration
 
 ## 5. Core Domain / Data Model
 
-The full set of tables, columns, types, and foreign keys is captured in the ER diagram below (§5.1). A few business rules aren't visible from column names alone and are called out here:
+The full set of tables, columns, types, and foreign keys is captured in the ER diagrams below (§5.1–§5.3). A few business rules aren't visible from column names alone and are called out here:
 
 - **`users.role`** defaults to `customer`; `admin` and `customer_service` are staff-provisioned (§4).
 - **`widgets.is_active`** is a soft "delisting" flag — widgets are never hard-deleted.
@@ -139,34 +139,18 @@ The full set of tables, columns, types, and foreign keys is captured in the ER d
 - **`refresh_tokens`** back the session/token-theft mitigations in §3.2: each row is a single-use, rotating refresh token stored hashed (never plaintext), with `expires_at` and `revoked_at`. Revoking a user's sessions (e.g. on password change) means setting `revoked_at` on their active rows here — the short-lived JWT access token itself is never persisted or revocable.
 - **No table ever stores a full card number, CVV, or expiration date.** Only the processor's opaque token (`payments.processor_card_token`) and display metadata (`card_last4`, `card_brand`) are persisted, consistent with basic PCI-DSS scope reduction.
 
-### 5.1 Proposed ER Diagram
+GitHub's Mermaid renderer reproducibly fails ("Unable to render rich display") on the single 13-entity version of this diagram this document used to have — a size/complexity limit in that sandboxed renderer rather than a syntax error (the full diagram parses and renders correctly under mermaid 9.4.3 through 11.4.0 tested directly, and it isn't a transient glitch — it fails consistently on reload). Splitting it by domain into three smaller diagrams, none with more than 6 fully-detailed entities, keeps each comfortably under whatever that limit is. An entity listed without its column list in a diagram below is repeated only to anchor a cross-diagram relationship — its full definition lives in the diagram where it's the primary subject.
+
+### 5.1 Proposed ER Diagram — Users & Catalog
 
 ```mermaid
 erDiagram
     USERS ||--o{ ADDRESSES : owns
     USERS ||--o{ CARTS : owns
-    USERS ||--o{ ORDERS : places
-    USERS ||--o{ REFUNDS : "issues (CS)"
-    USERS ||--o{ EXCHANGES : "processes (CS)"
-    USERS ||--o{ PASSWORD_RESET_TOKENS : requests
-    USERS ||--o{ REFRESH_TOKENS : "authenticates via"
-
     CATEGORIES ||--o{ WIDGETS : categorizes
     USERS ||--o{ WIDGETS : "created/updated by (admin)"
-
     CARTS ||--o{ CART_ITEMS : contains
     WIDGETS ||--o{ CART_ITEMS : "referenced by"
-
-    ADDRESSES ||--o{ ORDERS : "ships to"
-    ORDERS ||--o{ ORDER_ITEMS : contains
-    WIDGETS ||--o{ ORDER_ITEMS : "referenced by"
-
-    ORDERS ||--o| PAYMENTS : "paid via"
-    PAYMENTS ||--o{ REFUNDS : "refunded via"
-    ORDERS ||--o{ REFUNDS : "refunded on"
-
-    ORDERS ||--o{ EXCHANGES : "exchanged on"
-    WIDGETS ||--o{ EXCHANGES : "returned/replacement item"
 
     USERS {
         id id PK
@@ -226,6 +210,23 @@ erDiagram
         int quantity
         int unit_price_cents
     }
+```
+
+### 5.2 Proposed ER Diagram — Orders & Fulfillment
+
+```mermaid
+erDiagram
+    USERS ||--o{ ORDERS : places
+    USERS ||--o{ REFUNDS : "issues (CS)"
+    USERS ||--o{ EXCHANGES : "processes (CS)"
+    ADDRESSES ||--o{ ORDERS : "ships to"
+    ORDERS ||--o{ ORDER_ITEMS : contains
+    WIDGETS ||--o{ ORDER_ITEMS : "referenced by"
+    ORDERS ||--o| PAYMENTS : "paid via"
+    PAYMENTS ||--o{ REFUNDS : "refunded via"
+    ORDERS ||--o{ REFUNDS : "refunded on"
+    ORDERS ||--o{ EXCHANGES : "exchanged on"
+    WIDGETS ||--o{ EXCHANGES : "returned/replacement item"
 
     ORDERS {
         id id PK
@@ -282,6 +283,16 @@ erDiagram
         timestamp created_at
         timestamp updated_at
     }
+```
+
+### 5.3 Proposed ER Diagram — Auth & Session Security
+
+The `password_reset_tokens` and `refresh_tokens` tables that back §3.2 and §7.1a/§7.1b are split out here rather than folded into §5.1/§5.2, both to keep those diagrams smaller and because they're conceptually about session/credential security rather than the commerce domain.
+
+```mermaid
+erDiagram
+    USERS ||--o{ PASSWORD_RESET_TOKENS : requests
+    USERS ||--o{ REFRESH_TOKENS : "authenticates via"
 
     PASSWORD_RESET_TOKENS {
         id id PK
@@ -303,7 +314,7 @@ erDiagram
     }
 ```
 
-This diagram is a direct rendering of the tables and foreign keys defined above (§5); it does not introduce any structure not already specified there.
+Together, these three diagrams are a direct rendering of the tables and foreign keys defined above (§5); they do not introduce any structure not already specified there.
 
 ---
 
