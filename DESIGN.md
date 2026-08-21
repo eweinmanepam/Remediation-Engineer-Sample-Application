@@ -46,12 +46,7 @@ The following diagram reflects the containers described in §3 and §11: a brows
 
 ```mermaid
 flowchart TB
-    subgraph clients["Clients"]
-        guest["Guest"]
-        customer["Customer"]
-        admin["Admin"]
-        cs["Customer Service"]
-    end
+    clients["Clients\n(Guest, Customer, Admin, Customer Service)"]
 
     subgraph dockerhost["Docker Compose Environment (our infrastructure)"]
         gateway["gateway container\nAPI Gateway: TLS termination,\nrate limiting, JWT authN/token validation"]
@@ -63,10 +58,7 @@ flowchart TB
 
     processor["Payment Processor\n(external third-party gateway,\ne.g. Stripe-style)"]
 
-    guest -->|HTTPS| gateway
-    customer -->|HTTPS| gateway
-    admin -->|HTTPS| gateway
-    cs -->|HTTPS| gateway
+    clients -->|HTTPS| gateway
 
     gateway -->|"static assets"| spa
     gateway -->|"JSON REST API, rate limited +\nJWT validated (auth, catalog, cart, orders)"| api
