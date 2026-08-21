@@ -27,22 +27,22 @@ The app is a **Single Page Application (SPA)** frontend backed by a **REST API**
 
 ## 3. Tech Stack
 
-| Layer      | Choice                                                                                                                                                                               |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Frontend   | SPA (React or similar), calling the backend via JSON REST API                                                                                                                        |
-| API Gateway | Single public entry point in front of `web` and `api` (§3.3): TLS termination, rate limiting, JWT authN/token validation                                                           |
-| Backend    | Node.js API server (e.g. Express)                                                                                                                                                    |
-| Database   | SQL (PostgreSQL or SQLite for local/dev) via an ORM/query builder                                                                                                                    |
-| Auth       | Short-lived JWT access tokens (held in-memory client-side) + rotating opaque refresh tokens in an `HttpOnly`/`Secure`/`SameSite` cookie (see §3.2); password hashing (bcrypt/argon2) |
-| Email      | Transactional email provider (SMTP relay or API), used to deliver password-reset links                                                                                               |
-| Payments   | Real external payment processor (e.g. Stripe-style gateway), accessed over HTTPS via a thin client module                                                                            |
-| Deployment | Docker containers, orchestrated via Docker Compose                                                                                                                                   |
+| Layer       | Choice                                                                                                                                                                               |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Frontend    | SPA (React or similar), calling the backend via JSON REST API                                                                                                                        |
+| API Gateway | Single public entry point in front of `web` and `api` (§3.3): TLS termination, rate limiting, JWT authN/token validation                                                             |
+| Backend     | Node.js API server (e.g. Express)                                                                                                                                                    |
+| Database    | SQL (PostgreSQL or SQLite for local/dev) via an ORM/query builder                                                                                                                    |
+| Auth        | Short-lived JWT access tokens (held in-memory client-side) + rotating opaque refresh tokens in an `HttpOnly`/`Secure`/`SameSite` cookie (see §3.2); password hashing (bcrypt/argon2) |
+| Email       | Transactional email provider (SMTP relay or API), used to deliver password-reset links                                                                                               |
+| Payments    | External payment processor (e.g. Stripe-style gateway), accessed over HTTPS via a thin client module                                                                                 |
+| Deployment  | Docker containers, orchestrated via Docker Compose                                                                                                                                   |
 
 ---
 
 ## 3.1 Architecture Diagram
 
-The following diagram reflects the containers described in §3 and §11: a browser-hosted SPA, an API Gateway fronting the API, an API server backed by a SQL database, and a **real, third-party payment processor** that lives outside our infrastructure. All client traffic to our backend passes through the gateway; the SPA talks to the processor directly for tokenization, and the API talks to it server-to-server for charges/refunds.
+The following diagram reflects the containers described in §3 and §11: a browser-hosted SPA, an API Gateway fronting the API, an API server backed by a SQL database, and a third-party payment processor that lives outside our infrastructure. All client traffic to our backend passes through the gateway; the SPA talks to the processor directly for tokenization, and the API talks to it server-to-server for charges/refunds.
 
 ```mermaid
 flowchart TB
@@ -834,13 +834,13 @@ The application ships as a small set of containers, defined via a `docker-compos
 
 ### 11.1 Containers
 
-| Service                        | Image / Base                         | Notes                                                                                                       |
-| ------------------------------ | ------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `gateway`                      | nginx/Traefik or a dedicated API gateway image | Sole publicly published container (§3.3): TLS termination, rate limiting, JWT authN/token validation |
-| `web`                          | `node:XX-alpine` (multi-stage build) | Builds and serves the SPA (static build output served via nginx or a lightweight Node static server); reachable only from `gateway` |
-| `api`                          | `node:XX-alpine` (multi-stage build) | Express API server; reachable only from `gateway`                                                          |
-| `db`                           | `postgres:XX-alpine`                 | SQL database, named volume for data persistence                                                            |
-| `migrate` (optional, one-shot) | same image as `api`                  | Runs DB migrations/seed on startup, then exits                                                             |
+| Service                        | Image / Base                                   | Notes                                                                                                                               |
+| ------------------------------ | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `gateway`                      | nginx/Traefik or a dedicated API gateway image | Sole publicly published container (§3.3): TLS termination, rate limiting, JWT authN/token validation                                |
+| `web`                          | `node:XX-alpine` (multi-stage build)           | Builds and serves the SPA (static build output served via nginx or a lightweight Node static server); reachable only from `gateway` |
+| `api`                          | `node:XX-alpine` (multi-stage build)           | Express API server; reachable only from `gateway`                                                                                   |
+| `db`                           | `postgres:XX-alpine`                           | SQL database, named volume for data persistence                                                                                     |
+| `migrate` (optional, one-shot) | same image as `api`                            | Runs DB migrations/seed on startup, then exits                                                                                      |
 
 The **payment processor is not a container in this Compose stack** — it is a real, external, third-party service reached over the public internet via HTTPS. Only `api` (server-to-server) and the browser running the SPA (for client-side tokenization) talk to it; nothing about it is deployed or operated by us.
 
