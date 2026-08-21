@@ -38,6 +38,65 @@ This document intentionally leaves some implementation details open (they are fi
 
 ---
 
+## 3.1 Architecture Diagram
+
+The following diagram reflects the containers described in §3 and §11: a browser-hosted SPA, an API server backed by a SQL database, and a fictional payment processor that the SPA talks to directly for tokenization and that the API talks to for charges/refunds.
+
+```mermaid
+flowchart TB
+    subgraph clients["Clients"]
+        guest["Guest"]
+        customer["Customer"]
+        admin["Admin"]
+        cs["Customer Service"]
+    end
+
+    subgraph dockerhost["Docker Compose Environment"]
+        subgraph webc["web container"]
+            spa["SPA (React)\nstatic build served via nginx"]
+        end
+
+        subgraph apic["api container"]
+            api["REST API (Node.js / Express)\nauthN/authZ, business logic"]
+        end
+
+        subgraph dbc["db container"]
+            db[("SQL Database\nPostgreSQL")]
+        end
+
+        subgraph faux["fauxpay container"]
+            fauxpay["FauxPay\nfictional payment processor mock"]
+        end
+
+        migrate["migrate (one-shot)\nruns schema migrations/seed"]
+    end
+
+    guest -->|HTTPS| spa
+    customer -->|HTTPS| spa
+    admin -->|HTTPS| spa
+    cs -->|HTTPS| spa
+
+    spa -->|"JSON REST API\n(auth, catalog, cart, orders)"| api
+    spa -->|"POST /tokenize\n(card details, direct from browser)"| fauxpay
+
+    api -->|"parameterized SQL"| db
+    api -->|"POST /charge, POST /refund\n(server-to-server)"| fauxpay
+
+    migrate -->|"schema migrations"| db
+    migrate -.->|"must complete before api serves traffic"| api
+
+    style faux fill:#fee,stroke:#900
+    style dbc fill:#eef,stroke:#339
+```
+
+Key architectural points from this document:
+- The SPA never routes raw card data through the API (§6) — it goes browser → FauxPay directly, returning only an opaque `card_token`.
+- The API is the sole client of the database and is the actual authorization boundary (§4) even though the SPA also hides unauthorized UI.
+- `db` and `fauxpay` are not published to the host; only `api` (and, for tokenization, the browser) can reach `fauxpay`, and only `api` can reach `db` (§11.2).
+- `migrate` must complete before `api` accepts traffic (§11.4, §11.7.5).
+
+---
+
 ## 4. Roles & Permissions
 
 | Role | Capabilities |
@@ -203,6 +262,196 @@ Since FauxPay is fictional, it can be implemented as a small mock service (or an
 2. CS marks the return `received` once the item is physically back.
 3. CS completes the exchange: system creates/updates the replacement shipment; if replacement price differs from returned item, CS issues a partial refund or requests an additional payment (via a new FauxPay charge) to settle the difference.
 4. Order/exchange status updated to `completed`.
+
+---
+
+## 7.7 Sequence Diagrams
+
+### 7.7.1 Registration / Login (§7.1)
+
+```mermaid
+sequenceDiagram
+    actor Guest
+    participant SPA
+    participant API
+    participant DB
+
+    Guest->>SPA: Enter email, password, name
+    SPA->>API: POST /api/auth/register
+    API->>API: Hash password (bcrypt/argon2)
+    API->>DB: INSERT users (role=customer)
+    DB-->>API: user row
+    API-->>SPA: 201 Created
+    SPA-->>Guest: Registration confirmed
+
+    Guest->>SPA: Enter email, password
+    SPA->>API: POST /api/auth/login
+    API->>DB: SELECT user by email
+    DB-->>API: user row (password_hash)
+    API->>API: Verify password hash
+    API->>API: Issue session/JWT
+    API-->>SPA: 200 OK + session/JWT
+    SPA-->>Guest: Logged in
+```
+
+### 7.7.2 Browse Catalog (§7.2)
+
+```mermaid
+sequenceDiagram
+    actor User as Guest/Customer
+    participant SPA
+    participant API
+    participant DB
+
+    User->>SPA: Browse / search catalog
+    SPA->>API: GET /api/widgets?category=&q=
+    API->>DB: SELECT active widgets (filtered)
+    DB-->>API: widget rows
+    API-->>SPA: 200 OK (widget list)
+    SPA-->>User: Render catalog
+
+    User->>SPA: Open widget detail
+    SPA->>API: GET /api/widgets/:id
+    API->>DB: SELECT widget by id
+    DB-->>API: widget row
+    API-->>SPA: 200 OK (widget detail)
+    SPA-->>User: Render detail page
+```
+
+### 7.7.3 Cart & Checkout (§7.3)
+
+```mermaid
+sequenceDiagram
+    actor Customer
+    participant SPA
+    participant FauxPay
+    participant API
+    participant DB
+
+    Customer->>SPA: Add/update/remove cart items
+    SPA->>API: POST/PATCH/DELETE /api/cart/items
+    API->>DB: Upsert cart_items
+    DB-->>API: ack
+    API-->>SPA: 200 OK (cart state)
+
+    Customer->>SPA: Enter shipping address + card details
+    SPA->>FauxPay: POST /tokenize (card details, direct from browser)
+    FauxPay-->>SPA: card_token
+
+    SPA->>API: POST /api/orders {card_token, cart, shipping_address}
+    API->>DB: Re-price cart from widgets.price_cents
+    API->>DB: INSERT orders (status=pending_payment) + order_items
+    DB-->>API: order row
+
+    API->>FauxPay: POST /charge {card_token, amount_cents, order_id}
+    alt charge succeeds
+        FauxPay-->>API: {transaction_id, status, last4, brand}
+        API->>DB: INSERT payments row
+        API->>DB: UPDATE orders SET status=paid
+        API->>DB: Decrement widgets.stock_quantity
+        API->>DB: Clear cart
+        API-->>SPA: 201 Created (order confirmed)
+        SPA-->>Customer: Order confirmation
+    else charge fails
+        FauxPay-->>API: {status=failed}
+        API->>DB: UPDATE orders SET status=cancelled/failed
+        API-->>SPA: 402/4xx (payment failed)
+        SPA-->>Customer: Show failure, cart preserved
+    end
+```
+
+### 7.7.4 Admin — Catalog Management (§7.4)
+
+```mermaid
+sequenceDiagram
+    actor Admin
+    participant SPA
+    participant API
+    participant DB
+
+    Admin->>SPA: Create/edit widget (name, price, stock, category, active flag)
+    SPA->>API: POST/PATCH /api/admin/widgets(/:id)
+    API->>API: Check role == admin
+    API->>DB: INSERT/UPDATE widgets (created_by/updated_by)
+    DB-->>API: widget row
+    API-->>SPA: 200/201 OK
+    SPA-->>Admin: Catalog updated
+
+    Note over API,DB: Existing order_items.unit_price_cents are immutable;\nprice changes only affect future carts/orders.
+```
+
+### 7.7.5 Customer Service — Refunds (§7.5)
+
+```mermaid
+sequenceDiagram
+    actor CS as Customer Service
+    participant SPA
+    participant API
+    participant FauxPay
+    participant DB
+
+    CS->>SPA: Look up order (order id / customer email)
+    SPA->>API: GET /api/cs/orders/:id
+    API->>API: Check role == customer_service
+    API->>DB: SELECT order, payment
+    DB-->>API: order + payment rows
+    API-->>SPA: 200 OK (order detail)
+
+    CS->>SPA: Issue full/partial refund + reason
+    SPA->>API: POST /api/cs/orders/:id/refunds {amount_cents, reason}
+    API->>FauxPay: POST /refund {transaction_id, amount_cents}
+    FauxPay-->>API: {refund_id, status}
+    API->>DB: INSERT refunds (issued_by, amount_cents, reason, processor_refund_id)
+    API->>DB: UPDATE payments.status, orders.status (refunded/partially_refunded)
+    DB-->>API: ack
+    API-->>SPA: 200 OK (refund recorded)
+    SPA-->>CS: Refund confirmation
+```
+
+### 7.7.6 Customer Service — Exchanges (§7.6)
+
+```mermaid
+sequenceDiagram
+    actor Customer
+    actor CS as Customer Service
+    participant SPA
+    participant API
+    participant FauxPay
+    participant DB
+
+    Customer->>SPA: Request exchange (returned item, desired replacement)
+    SPA->>API: POST /api/cs/orders/:id/exchanges
+    API->>DB: INSERT exchanges (status=requested)
+    DB-->>API: exchange row
+    API-->>SPA: 201 Created
+
+    CS->>SPA: Mark return received
+    SPA->>API: PATCH /api/cs/exchanges/:id {status=received}
+    API->>DB: UPDATE exchanges SET status=received
+    DB-->>API: ack
+
+    CS->>SPA: Complete exchange
+    SPA->>API: PATCH /api/cs/exchanges/:id {status=completed}
+    API->>DB: Create/update replacement shipment
+
+    alt replacement price differs from returned item
+        alt replacement cheaper
+            API->>FauxPay: POST /refund (settle difference)
+            FauxPay-->>API: {refund_id, status}
+            API->>DB: INSERT refunds row
+        else replacement more expensive
+            API->>FauxPay: POST /charge (collect difference)
+            FauxPay-->>API: {transaction_id, status}
+            API->>DB: INSERT payments row
+        end
+    end
+
+    API->>DB: UPDATE exchanges SET status=completed
+    API->>DB: UPDATE orders.status accordingly
+    DB-->>API: ack
+    API-->>SPA: 200 OK
+    SPA-->>CS: Exchange completed
+```
 
 ---
 
