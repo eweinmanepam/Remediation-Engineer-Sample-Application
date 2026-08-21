@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-Widget Shop is a simple e-commerce sample application used for remediation-engineer training. It lets customers register, browse a catalog of widgets, add items to a cart, and check out with a credit card processed by a **fictional external payment processor**. Backend admins manage the catalog and pricing; a customer service role handles refunds and exchanges.
+Widget Shop is a simple e-commerce sample application used for remediation-engineer training. It lets customers register, browse a catalog of widgets, add items to a cart, and check out with a credit card processed by a **third-party external payment processor** (e.g. a Stripe-style gateway). Backend admins manage the catalog and pricing; a customer service role handles refunds and exchanges.
 
 The app is a **Single Page Application (SPA)** frontend backed by a **REST API**, with a **SQL database** for persistence, and is deployed as a set of **Docker containers**.
 
@@ -16,10 +16,10 @@ This document intentionally leaves some implementation details open (they are fi
 - Realistic, small-scope e-commerce app: auth, catalog, cart, checkout, order history, refunds/exchanges.
 - Clear separation of roles: Customer, Admin, Customer Service.
 - Simple enough to reason about end-to-end (schema, API, UI) for training purposes.
-- Fictional payment processor integration point that mimics a real gateway (tokenization, charge, refund) without any real financial processing.
+- Integration with a real external payment processor's API surface (tokenization, charge, refund).
 
 **Non-Goals**
-- No real payment processing, PCI compliance, or storage of raw card data.
+- No PCI compliance program to build/audit ourselves — card data is tokenized directly with the processor, minimizing our PCI scope.
 - No multi-tenancy, internationalization, tax calculation, or shipping-carrier integration.
 - No high-availability / scaling concerns — this is a training sample, not production infrastructure.
 
@@ -33,14 +33,14 @@ This document intentionally leaves some implementation details open (they are fi
 | Backend | Node.js API server (e.g. Express) |
 | Database | SQL (PostgreSQL or SQLite for local/dev) via an ORM/query builder |
 | Auth | Session- or JWT-based auth, password hashing (bcrypt/argon2) |
-| Payments | Fictional external processor, accessed over HTTPS via a thin client module |
+| Payments | Real external payment processor (e.g. Stripe-style gateway), accessed over HTTPS via a thin client module |
 | Deployment | Docker containers, orchestrated via Docker Compose |
 
 ---
 
 ## 3.1 Architecture Diagram
 
-The following diagram reflects the containers described in §3 and §11: a browser-hosted SPA, an API server backed by a SQL database, and a fictional payment processor that the SPA talks to directly for tokenization and that the API talks to for charges/refunds.
+The following diagram reflects the containers described in §3 and §11: a browser-hosted SPA, an API server backed by a SQL database, and a **real, third-party payment processor** that lives outside our infrastructure. The SPA talks to the processor directly for tokenization, and the API talks to it server-to-server for charges/refunds.
 
 ```mermaid
 flowchart TB
@@ -51,7 +51,7 @@ flowchart TB
         cs["Customer Service"]
     end
 
-    subgraph dockerhost["Docker Compose Environment"]
+    subgraph dockerhost["Docker Compose Environment (our infrastructure)"]
         subgraph webc["web container"]
             spa["SPA (React)\nstatic build served via nginx"]
         end
@@ -64,12 +64,10 @@ flowchart TB
             db[("SQL Database\nPostgreSQL")]
         end
 
-        subgraph faux["fauxpay container"]
-            fauxpay["FauxPay\nfictional payment processor mock"]
-        end
-
         migrate["migrate (one-shot)\nruns schema migrations/seed"]
     end
+
+    processor["Payment Processor\n(external third-party gateway,\ne.g. Stripe-style)"]
 
     guest -->|HTTPS| spa
     customer -->|HTTPS| spa
@@ -77,22 +75,23 @@ flowchart TB
     cs -->|HTTPS| spa
 
     spa -->|"JSON REST API\n(auth, catalog, cart, orders)"| api
-    spa -->|"POST /tokenize\n(card details, direct from browser)"| fauxpay
+    spa -->|"POST /tokenize\n(card details, direct from browser)"| processor
 
     api -->|"parameterized SQL"| db
-    api -->|"POST /charge, POST /refund\n(server-to-server)"| fauxpay
+    api -->|"POST /charge, POST /refund\n(server-to-server, over the internet)"| processor
 
     migrate -->|"schema migrations"| db
     migrate -.->|"must complete before api serves traffic"| api
 
-    style faux fill:#fee,stroke:#900
+    style processor fill:#fee,stroke:#900
     style dbc fill:#eef,stroke:#339
 ```
 
 Key architectural points from this document:
-- The SPA never routes raw card data through the API (§6) — it goes browser → FauxPay directly, returning only an opaque `card_token`.
+- The SPA never routes raw card data through the API (§6) — it goes browser → payment processor directly, returning only an opaque `card_token`.
+- The payment processor is an **external system outside our trust boundary**, reached over the public internet — not a container we operate (§11.1).
 - The API is the sole client of the database and is the actual authorization boundary (§4) even though the SPA also hides unauthorized UI.
-- `db` and `fauxpay` are not published to the host; only `api` (and, for tokenization, the browser) can reach `fauxpay`, and only `api` can reach `db` (§11.2).
+- `db` is not published to the host; only `api` can reach it (§11.2).
 - `migrate` must complete before `api` accepts traffic (§11.4, §11.7.5).
 
 ---
@@ -183,7 +182,7 @@ Admin and CS accounts are internal/staff accounts, not self-service registration
 |---|---|---|
 | id | PK | |
 | order_id | FK → orders | |
-| processor_transaction_id | string | ID returned by fictional processor |
+| processor_transaction_id | string | ID returned by the payment processor |
 | processor_card_token | string | tokenized card reference (never raw PAN) |
 | amount_cents | int | |
 | status | enum: `authorized`, `captured`, `failed`, `refunded`, `partially_refunded` | |
@@ -214,19 +213,19 @@ Admin and CS accounts are internal/staff accounts, not self-service registration
 | notes | text | |
 | created_at / updated_at | timestamp | |
 
-**No table ever stores a full card number, CVV, or expiration date.** Only the fictional processor's opaque token and display metadata (last4, brand) are persisted, consistent with basic PCI-DSS scope reduction.
+**No table ever stores a full card number, CVV, or expiration date.** Only the processor's opaque token and display metadata (last4, brand) are persisted, consistent with basic PCI-DSS scope reduction.
 
 ---
 
-## 6. Fictional Payment Processor
+## 6. Payment Processor Integration
 
-A stand-in gateway, e.g. **"FauxPay"**, exposed to the backend as an internal client module (`services/fauxpayClient.js` or similar) that calls a mocked/fictional HTTPS API. It supports:
+The application integrates with a **real, external, third-party payment processor** (e.g. a Stripe-style gateway) over HTTPS, accessed from the backend through an internal client module (`services/paymentClient.js` or similar). The integration surface:
 
-- `POST /tokenize` — accepts card details **directly from client-side SPA to FauxPay**, never through our backend, returning a `card_token`. (This mirrors real-world practice: our server never sees/touches raw PAN, minimizing our PCI scope.)
+- `POST /tokenize` — accepts card details **directly from the client-side SPA to the processor**, never through our backend, returning a `card_token`. (This mirrors real-world practice: our server never sees/touches raw PAN, minimizing our PCI scope.)
 - `POST /charge` — backend calls with `{ card_token, amount_cents, currency, order_id }`, returns `{ transaction_id, status, last4, brand }`.
 - `POST /refund` — backend calls with `{ transaction_id, amount_cents }`, returns `{ refund_id, status }`.
 
-Since FauxPay is fictional, it can be implemented as a small mock service (or an in-process fake) that simulates realistic latency/success/failure — good enough for training scenarios that need to exercise both happy-path and failure/error handling.
+This integration surface is intentionally modeled on how real gateways work (client-side tokenization, server-side charge/refund) rather than being a bespoke protocol, so the app's behavior generalizes to whichever real processor a deployment chooses. See §10 for how this integration is tested without moving real money.
 
 ---
 
@@ -241,9 +240,9 @@ Since FauxPay is fictional, it can be implemented as a small mock service (or an
 
 ### 7.3 Cart & Checkout
 1. Authenticated customer adds/updates/removes items in their cart.
-2. On checkout: customer supplies shipping address and card details (entered directly into a FauxPay-hosted field/component in the SPA → tokenized client-side).
+2. On checkout: customer supplies shipping address and card details (entered directly into a payment-processor-hosted field/component in the SPA → tokenized client-side).
 3. SPA sends `card_token` + cart + shipping address to backend `POST /orders`.
-4. Backend re-prices cart from current `widgets.price_cents`, creates `orders` (status `pending_payment`) + `order_items`, calls FauxPay `/charge`.
+4. Backend re-prices cart from current `widgets.price_cents`, creates `orders` (status `pending_payment`) + `order_items`, calls the payment processor `/charge`.
 5. On success: create `payments` row, set order status `paid`, decrement `stock_quantity`, clear cart.
 6. On failure: order marked failed/cancelled, customer notified, cart preserved.
 
@@ -254,13 +253,13 @@ Since FauxPay is fictional, it can be implemented as a small mock service (or an
 ### 7.5 Customer Service — Refunds
 1. CS looks up an order (by order id, customer email, etc.).
 2. CS issues a full or partial refund with a reason.
-3. Backend calls FauxPay `/refund` for `amount_cents` against the original `processor_transaction_id`.
+3. Backend calls the payment processor `/refund` for `amount_cents` against the original `processor_transaction_id`.
 4. On success: create `refunds` row, update `payments.status` and `orders.status` (`refunded`/`partially_refunded`).
 
 ### 7.6 Customer Service — Exchanges
 1. Customer (or CS on their behalf) requests an exchange on a delivered order, specifying returned item(s) and desired replacement.
 2. CS marks the return `received` once the item is physically back.
-3. CS completes the exchange: system creates/updates the replacement shipment; if replacement price differs from returned item, CS issues a partial refund or requests an additional payment (via a new FauxPay charge) to settle the difference.
+3. CS completes the exchange: system creates/updates the replacement shipment; if replacement price differs from returned item, CS issues a partial refund or requests an additional payment (via a new charge through the payment processor) to settle the difference.
 4. Order/exchange status updated to `completed`.
 
 ---
@@ -324,7 +323,7 @@ sequenceDiagram
 sequenceDiagram
     actor Customer
     participant SPA
-    participant FauxPay
+    participant Processor as Payment Processor
     participant API
     participant DB
 
@@ -335,17 +334,17 @@ sequenceDiagram
     API-->>SPA: 200 OK (cart state)
 
     Customer->>SPA: Enter shipping address + card details
-    SPA->>FauxPay: POST /tokenize (card details, direct from browser)
-    FauxPay-->>SPA: card_token
+    SPA->>Processor: POST /tokenize (card details, direct from browser)
+    Processor-->>SPA: card_token
 
     SPA->>API: POST /api/orders {card_token, cart, shipping_address}
     API->>DB: Re-price cart from widgets.price_cents
     API->>DB: INSERT orders (status=pending_payment) + order_items
     DB-->>API: order row
 
-    API->>FauxPay: POST /charge {card_token, amount_cents, order_id}
+    API->>Processor: POST /charge {card_token, amount_cents, order_id}
     alt charge succeeds
-        FauxPay-->>API: {transaction_id, status, last4, brand}
+        Processor-->>API: {transaction_id, status, last4, brand}
         API->>DB: INSERT payments row
         API->>DB: UPDATE orders SET status=paid
         API->>DB: Decrement widgets.stock_quantity
@@ -353,7 +352,7 @@ sequenceDiagram
         API-->>SPA: 201 Created (order confirmed)
         SPA-->>Customer: Order confirmation
     else charge fails
-        FauxPay-->>API: {status=failed}
+        Processor-->>API: {status=failed}
         API->>DB: UPDATE orders SET status=cancelled/failed
         API-->>SPA: 402/4xx (payment failed)
         SPA-->>Customer: Show failure, cart preserved
@@ -387,7 +386,7 @@ sequenceDiagram
     actor CS as Customer Service
     participant SPA
     participant API
-    participant FauxPay
+    participant Processor as Payment Processor
     participant DB
 
     CS->>SPA: Look up order (order id / customer email)
@@ -399,8 +398,8 @@ sequenceDiagram
 
     CS->>SPA: Issue full/partial refund + reason
     SPA->>API: POST /api/cs/orders/:id/refunds {amount_cents, reason}
-    API->>FauxPay: POST /refund {transaction_id, amount_cents}
-    FauxPay-->>API: {refund_id, status}
+    API->>Processor: POST /refund {transaction_id, amount_cents}
+    Processor-->>API: {refund_id, status}
     API->>DB: INSERT refunds (issued_by, amount_cents, reason, processor_refund_id)
     API->>DB: UPDATE payments.status, orders.status (refunded/partially_refunded)
     DB-->>API: ack
@@ -416,7 +415,7 @@ sequenceDiagram
     actor CS as Customer Service
     participant SPA
     participant API
-    participant FauxPay
+    participant Processor as Payment Processor
     participant DB
 
     Customer->>SPA: Request exchange (returned item, desired replacement)
@@ -436,12 +435,12 @@ sequenceDiagram
 
     alt replacement price differs from returned item
         alt replacement cheaper
-            API->>FauxPay: POST /refund (settle difference)
-            FauxPay-->>API: {refund_id, status}
+            API->>Processor: POST /refund (settle difference)
+            Processor-->>API: {refund_id, status}
             API->>DB: INSERT refunds row
         else replacement more expensive
-            API->>FauxPay: POST /charge (collect difference)
-            FauxPay-->>API: {transaction_id, status}
+            API->>Processor: POST /charge (collect difference)
+            Processor-->>API: {transaction_id, status}
             API->>DB: INSERT payments row
         end
     end
@@ -504,7 +503,7 @@ All non-public endpoints require authentication; role-restricted endpoints addit
 1. Users can register and log in with email + password.
 2. Any user (including guests) can browse and search the widget catalog.
 3. Authenticated customers can add/update/remove items in a cart and check out.
-4. Checkout requires a shipping address and a credit card, processed via the fictional external processor; the app never stores raw card numbers.
+4. Checkout requires a shipping address and a credit card, processed via the external payment processor; the app never stores raw card numbers.
 5. Successful checkout creates an order and decrements stock; failed checkout leaves the cart intact.
 6. Admins can create, edit, and deactivate widgets, including setting price and stock.
 7. Admins can view all orders (read-only) and manage staff role assignments.
@@ -517,7 +516,7 @@ All non-public endpoints require authentication; role-restricted endpoints addit
 - **Security**: password hashing, parameterized SQL (no string-concatenated queries), server-side authZ on every endpoint, no raw card data at rest, HTTPS assumed in deployment.
 - **Data integrity**: order line items and prices are immutable once an order is placed; catalog price changes never retroactively alter past orders.
 - **Auditability**: refunds and exchanges record the acting staff user, timestamp, and reason.
-- **Testability**: fictional payment processor is mockable/deterministic for automated tests.
+- **Testability**: the payment processor client is implemented behind an interface/module boundary so it can be pointed at the processor's sandbox/test mode, or replaced with a test double, for local development and automated tests — this is a testing concern and does not change the production architecture, which always talks to the real processor.
 
 ---
 
@@ -532,20 +531,22 @@ The application ships as a small set of containers, defined via a `docker-compos
 | `web` | `node:XX-alpine` (multi-stage build) | Builds and serves the SPA (static build output served via nginx or a lightweight Node static server) |
 | `api` | `node:XX-alpine` (multi-stage build) | Express API server |
 | `db` | `postgres:XX-alpine` | SQL database, named volume for data persistence |
-| `fauxpay` | `node:XX-alpine` | Fictional payment processor mock service, isolated on its own internal network segment |
 | `migrate` (optional, one-shot) | same image as `api` | Runs DB migrations/seed on startup, then exits |
+
+The **payment processor is not a container in this Compose stack** — it is a real, external, third-party service reached over the public internet via HTTPS. Only `api` (server-to-server) and the browser running the SPA (for client-side tokenization) talk to it; nothing about it is deployed or operated by us.
 
 ### 11.2 Networking
 
 - A single Docker Compose network (or two: `frontend` and `backend`) so that:
   - `web` is reachable from the host (published port, e.g. `80`/`443`).
   - `api` is reachable from `web` and the host (for local dev), but in a hardened deployment only `web`/reverse-proxy would be published — `api` stays internal.
-  - `db` and `fauxpay` are **not** published to the host; only `api` can reach them.
+  - `db` is **not** published to the host; only `api` can reach it.
+  - `api` requires outbound HTTPS access to the payment processor's public endpoints.
 - A reverse proxy (nginx/Traefik) container can front `web` + `api` under one origin to avoid CORS and to terminate TLS.
 
 ### 11.3 Configuration & Secrets
 
-- All service configuration (DB connection string, JWT/session secret, FauxPay base URL/API key, port numbers) is supplied via environment variables, not hardcoded.
+- All service configuration (DB connection string, JWT/session secret, payment processor base URL/API key, port numbers) is supplied via environment variables, not hardcoded.
 - Local dev uses a `.env` file (excluded from version control via `.gitignore`); example values live in a committed `.env.example`.
 - Database credentials and any signing secrets are treated as secrets — for Compose-based training use, env vars are acceptable; a real deployment would use Docker secrets or a secrets manager.
 
@@ -571,10 +572,9 @@ services:
 
   api:
     build: ./api
-    env_file: .env
+    env_file: .env               # includes PAYMENT_PROCESSOR_BASE_URL / API key
     depends_on:
       db: { condition: service_healthy }
-      fauxpay: { condition: service_started }
     expose: ["3000"]
 
   migrate:
@@ -594,18 +594,16 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U widgetshop"]
 
-  fauxpay:
-    build: ./fauxpay
-    expose: ["4000"]
-
 volumes:
   db_data:
 ```
 
+*(The payment processor is external and has no service entry here — `api` reaches it via `PAYMENT_PROCESSOR_BASE_URL` over the public internet.)*
+
 ### 11.7 Deployment-Related Requirements
 
-1. The app must run end-to-end via a single `docker compose up` with no manual host setup beyond providing a `.env`.
-2. `db` and `fauxpay` must not be exposed on host-published ports.
+1. The app must run end-to-end via a single `docker compose up` with no manual host setup beyond providing a `.env` (including payment processor credentials).
+2. `db` must not be exposed on host-published ports.
 3. No secret values are baked into images; all are injected at runtime via env vars/secrets.
 4. Container images run as non-root and contain no dev-only tooling in the runtime stage.
 5. `api` must not accept traffic until database migrations have completed successfully.
