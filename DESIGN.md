@@ -2,11 +2,11 @@
 
 ## 1. Overview
 
-Widget Shop is a simple e-commerce sample application used for remediation-engineer training. It lets customers register, browse a catalog of widgets, add items to a cart, and check out with a credit card processed by a **third-party external payment processor** (e.g. a Stripe-style gateway). Backend admins manage the catalog and pricing; a customer service role handles refunds and exchanges.
+Widget Shop is a small e-commerce application. It lets customers register, browse a catalog of widgets, add items to a cart, and check out with a credit card processed by a **third-party external payment processor** (e.g. a Stripe-style gateway). Backend admins manage the catalog and pricing; a customer service role handles refunds and exchanges.
 
 The app is a **Single Page Application (SPA)** frontend backed by a **REST API**, with a **SQL database** for persistence, and is deployed as a set of **Docker containers**.
 
-This document intentionally leaves some implementation details open (they are filled in by the training scenarios), but defines enough structure — data model, API surface, roles, and flows — to build a working, realistic app that can later have vulnerabilities introduced/remediated.
+This document defines the data model, API surface, roles, and flows needed to build the application end to end. A few low-level implementation choices (exact ORM, specific library versions, internal code organization) are left to the engineering team building each service, but the structure here is complete enough to implement directly.
 
 ---
 
@@ -15,13 +15,13 @@ This document intentionally leaves some implementation details open (they are fi
 **Goals**
 - Realistic, small-scope e-commerce app: auth, catalog, cart, checkout, order history, refunds/exchanges.
 - Clear separation of roles: Customer, Admin, Customer Service.
-- Simple enough to reason about end-to-end (schema, API, UI) for training purposes.
+- Simple enough to reason about end-to-end (schema, API, UI).
 - Integration with a real external payment processor's API surface (tokenization, charge, refund).
 
 **Non-Goals**
 - No PCI compliance program to build/audit ourselves — card data is tokenized directly with the processor, minimizing our PCI scope.
 - No multi-tenancy, internationalization, tax calculation, or shipping-carrier integration.
-- No high-availability / scaling concerns — this is a training sample, not production infrastructure.
+- No high-availability / multi-region scaling in this phase — a single-region deployment is sufficient for current business volume.
 
 ---
 
@@ -815,7 +815,7 @@ All non-public endpoints require authentication; role-restricted endpoints addit
 
 ## 11. Deployment (Docker)
 
-The application ships as a small set of containers, defined via a `docker-compose.yml` for local/training use (a production-style deployment would split these across separate hosts/services, but Compose is sufficient for this sample).
+The application ships as a small set of containers, defined via a `docker-compose.yml` for local development and single-host deployment (a larger-scale deployment would split these across separate hosts/services, but Compose is sufficient at current scale).
 
 ### 11.1 Containers
 
@@ -841,7 +841,7 @@ The **payment processor is not a container in this Compose stack** — it is a r
 
 - All service configuration (DB connection string, JWT/session secret, payment processor base URL/API key, port numbers) is supplied via environment variables, not hardcoded.
 - Local dev uses a `.env` file (excluded from version control via `.gitignore`); example values live in a committed `.env.example`.
-- Database credentials and any signing secrets are treated as secrets — for Compose-based training use, env vars are acceptable; a real deployment would use Docker secrets or a secrets manager.
+- Database credentials and any signing secrets are treated as secrets — for Compose-based deployment, env vars are acceptable; a larger-scale deployment would use Docker secrets or a secrets manager.
 
 ### 11.4 Data Persistence & Migrations
 
