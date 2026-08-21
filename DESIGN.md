@@ -113,107 +113,14 @@ Admin and CS accounts are internal/staff accounts, not self-service registration
 
 ## 5. Core Domain / Data Model
 
-### `users`
-| Column | Type | Notes |
-|---|---|---|
-| id | PK | |
-| email | unique, not null | login identifier |
-| password_hash | not null | bcrypt/argon2 |
-| full_name | | |
-| role | enum: `customer`, `admin`, `customer_service` | default `customer` |
-| created_at | timestamp | |
+The full set of tables, columns, types, and foreign keys is captured in the ER diagram below (§5.1). A few business rules aren't visible from column names alone and are called out here:
 
-### `addresses`
-| Column | Type | Notes |
-|---|---|---|
-| id | PK | |
-| user_id | FK → users | |
-| line1, line2, city, state, postal_code, country | | |
-| is_default_shipping / is_default_billing | bool | |
-
-### `widgets` (catalog items)
-| Column | Type | Notes |
-|---|---|---|
-| id | PK | |
-| sku | unique | |
-| name | not null | |
-| description | text | |
-| price_cents | int, not null | current price, set by Admin |
-| currency | default `USD` | |
-| stock_quantity | int | |
-| category_id | FK → categories, nullable | |
-| image_url | | |
-| is_active | bool | soft "delisting" instead of hard delete |
-| created_by / updated_by | FK → users (admin) | |
-| created_at / updated_at | timestamp | |
-
-### `categories`
-| Column | Type |
-|---|---|
-| id | PK |
-| name | unique |
-
-### `carts` / `cart_items`
-- `carts`: one active cart per user (or session for guests, if guest carts are supported — otherwise require login before cart use).
-- `cart_items`: `cart_id`, `widget_id`, `quantity`, `unit_price_cents` (snapshotted at add-time or re-priced at checkout — decide and document; recommend **re-pricing at checkout** from `widgets.price_cents` to avoid stale-price abuse).
-
-### `orders`
-| Column | Type | Notes |
-|---|---|---|
-| id | PK | |
-| user_id | FK → users | |
-| status | enum: `pending_payment`, `paid`, `refunded`, `partially_refunded`, `exchange_pending`, `exchanged`, `cancelled` | |
-| subtotal_cents, total_cents | int | |
-| shipping_address_id | FK | |
-| payment_id | FK → payments | |
-| created_at | timestamp | |
-
-### `order_items`
-| Column | Type |
-|---|---|
-| id | PK |
-| order_id | FK → orders |
-| widget_id | FK → widgets |
-| quantity | int |
-| unit_price_cents | int (price at time of purchase — immutable) |
-
-### `payments`
-| Column | Type | Notes |
-|---|---|---|
-| id | PK | |
-| order_id | FK → orders | |
-| processor_transaction_id | string | ID returned by the payment processor |
-| processor_card_token | string | tokenized card reference (never raw PAN) |
-| amount_cents | int | |
-| status | enum: `authorized`, `captured`, `failed`, `refunded`, `partially_refunded` | |
-| card_last4, card_brand | string | display only, from processor response |
-| created_at | timestamp | |
-
-### `refunds`
-| Column | Type | Notes |
-|---|---|---|
-| id | PK | |
-| order_id | FK → orders | |
-| payment_id | FK → payments | |
-| issued_by | FK → users | CS agent |
-| amount_cents | int | |
-| reason | text | |
-| processor_refund_id | string | |
-| created_at | timestamp | |
-
-### `exchanges`
-| Column | Type | Notes |
-|---|---|---|
-| id | PK | |
-| order_id | FK → orders | original order |
-| processed_by | FK → users | CS agent |
-| returned_widget_id / returned_quantity | | item(s) sent back |
-| replacement_widget_id / replacement_quantity | | item(s) shipped instead |
-| status | enum: `requested`, `received`, `completed`, `rejected` | |
-| notes | text | |
-| created_at / updated_at | timestamp | |
-
-**No table ever stores a full card number, CVV, or expiration date.** Only the processor's opaque token and display metadata (last4, brand) are persisted, consistent with basic PCI-DSS scope reduction.
+- **`users.role`** defaults to `customer`; `admin` and `customer_service` are staff-provisioned (§4).
+- **`widgets.is_active`** is a soft "delisting" flag — widgets are never hard-deleted.
+- **Carts**: one active cart per user (or session for guests, if guest carts are supported — otherwise require login before cart use).
+- **`cart_items.unit_price_cents`**: recommend **re-pricing at checkout** from `widgets.price_cents` rather than trusting a price snapshotted at add-time, to avoid stale-price abuse.
+- **`order_items.unit_price_cents`** is immutable once set — it is the price at time of purchase and is never affected by later catalog price changes.
+- **No table ever stores a full card number, CVV, or expiration date.** Only the processor's opaque token (`payments.processor_card_token`) and display metadata (`card_last4`, `card_brand`) are persisted, consistent with basic PCI-DSS scope reduction.
 
 ### 5.1 Proposed ER Diagram
 
