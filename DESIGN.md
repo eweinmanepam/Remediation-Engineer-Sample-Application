@@ -122,6 +122,7 @@ The full set of tables, columns, types, and foreign keys is captured in the ER d
 - **`cart_items.unit_price_cents`**: recommend **re-pricing at checkout** from `widgets.price_cents` rather than trusting a price snapshotted at add-time, to avoid stale-price abuse.
 - **`order_items.unit_price_cents`** is immutable once set — it is the price at time of purchase and is never affected by later catalog price changes.
 - **`password_reset_tokens`** are single-use and time-limited: a token is stored hashed (never plaintext), carries an `expires_at`, and is marked used (or deleted) the moment it's redeemed or superseded by a newer request.
+- **`users.failed_login_attempts` / `locked_until`** implement account lockout: consecutive failed logins increment the counter; reaching a configured threshold sets `locked_until` (a cooldown period) and further login attempts are rejected until it elapses. A successful login resets the counter.
 - **No table ever stores a full card number, CVV, or expiration date.** Only the processor's opaque token (`payments.processor_card_token`) and display metadata (`card_last4`, `card_brand`) are persisted, consistent with basic PCI-DSS scope reduction.
 
 ### 5.1 Proposed ER Diagram
@@ -158,6 +159,8 @@ erDiagram
         string password_hash
         string full_name
         enum role "customer, admin, customer_service"
+        int failed_login_attempts "default 0"
+        timestamp locked_until "nullable"
         timestamp created_at
     }
 
@@ -295,7 +298,7 @@ This integration surface is intentionally modeled on how real gateways work (cli
 
 ### 7.1 Registration / Login
 1. Guest submits email/password (+ name) → server hashes password, creates `users` row with role `customer`.
-2. Login validates credentials, issues session/JWT.
+2. Login validates credentials, issues session/JWT. See §7.1c for the account-lockout behavior applied on repeated failures.
 
 ### 7.1a Forgot / Reset Password
 1. Guest submits their email on a "forgot password" form.
@@ -309,6 +312,13 @@ This integration surface is intentionally modeled on how real gateways work (cli
 2. Server re-verifies the current password against `users.password_hash` before allowing the change (prevents a hijacked session with a stolen token/cookie, but no credentials, from silently taking over the account).
 3. On success: server hashes and stores the new password, and invalidates the user's other active sessions.
 4. On failure (current password incorrect): request rejected, password unchanged.
+
+### 7.1c Account Lockout / Login
+1. Login request arrives with email + password.
+2. Server looks up the user and first checks `locked_until`: if it's set and still in the future, the request is rejected immediately (generic "account temporarily locked, try again later" response) — the password is not checked.
+3. Otherwise, server verifies the password:
+   - **Incorrect**: increment `failed_login_attempts`. If the new count reaches the configured threshold (e.g. 5), set `locked_until` to now + a cooldown window (e.g. 15 minutes). Respond with a generic "invalid email or password" error either way (the account-locked message is only shown once the threshold is actually hit, on that same response).
+   - **Correct**: reset `failed_login_attempts` to 0, clear `locked_until`, issue a session/JWT.
 
 ### 7.2 Browse Catalog
 - Public endpoint lists active widgets, filterable by category, searchable by name; widget detail view shows description/price/stock.
@@ -604,6 +614,49 @@ sequenceDiagram
     end
 ```
 
+### 7.7.9 Account Lockout / Login (§7.1c)
+
+```mermaid
+sequenceDiagram
+    actor User as Guest/Customer
+    participant SPA
+    participant API
+    participant DB
+
+    User->>SPA: Submit email + password
+    SPA->>API: POST /api/auth/login {email, password}
+    API->>DB: SELECT user by email (failed_login_attempts, locked_until)
+    DB-->>API: user row
+
+    alt locked_until is set and in the future
+        API-->>SPA: 423/429 "Account temporarily locked, try again later"
+        SPA-->>User: Show lockout message
+    else not locked
+        API->>API: Verify password against password_hash
+
+        alt password correct
+            API->>DB: UPDATE users SET failed_login_attempts=0, locked_until=NULL
+            API->>API: Issue session/JWT
+            DB-->>API: ack
+            API-->>SPA: 200 OK + session/JWT
+            SPA-->>User: Logged in
+        else password incorrect
+            API->>DB: UPDATE users SET failed_login_attempts += 1
+            DB-->>API: new attempt count
+
+            alt attempt count reaches threshold (e.g. 5)
+                API->>DB: UPDATE users SET locked_until = now + cooldown
+                DB-->>API: ack
+                API-->>SPA: 423/429 "Account temporarily locked"
+                SPA-->>User: Show lockout message
+            else below threshold
+                API-->>SPA: 401 "Invalid email or password"
+                SPA-->>User: Show generic error
+            end
+        end
+    end
+```
+
 ---
 
 ## 8. API Surface (representative, not exhaustive)
@@ -667,10 +720,11 @@ All non-public endpoints require authentication; role-restricted endpoints addit
 10. Role-based access control is enforced on the backend for every state-changing operation.
 11. Users can request a password reset email and set a new password via a single-use, time-limited link, without revealing whether a given email is registered.
 12. Authenticated users can change their password by re-confirming their current password.
+13. An account is temporarily locked out after a configured number of consecutive failed login attempts, and automatically unlocks after a cooldown period.
 
 ## 10. Non-Functional Requirements
 
-- **Security**: password hashing, parameterized SQL (no string-concatenated queries), server-side authZ on every endpoint, no raw card data at rest, HTTPS assumed in deployment. Password reset tokens are single-use, time-limited, stored hashed, and the forgot-password endpoint is rate-limited and returns a uniform response to avoid user enumeration.
+- **Security**: password hashing, parameterized SQL (no string-concatenated queries), server-side authZ on every endpoint, no raw card data at rest, HTTPS assumed in deployment. Password reset tokens are single-use, time-limited, stored hashed, and the forgot-password endpoint is rate-limited and returns a uniform response to avoid user enumeration. Login enforces account lockout after repeated failed attempts to slow down credential-stuffing/brute-force attacks.
 - **Data integrity**: order line items and prices are immutable once an order is placed; catalog price changes never retroactively alter past orders.
 - **Auditability**: refunds and exchanges record the acting staff user, timestamp, and reason.
 - **Testability**: the payment processor client is implemented behind an interface/module boundary so it can be pointed at the processor's sandbox/test mode, or replaced with a test double, for local development and automated tests — this is a testing concern and does not change the production architecture, which always talks to the real processor.
