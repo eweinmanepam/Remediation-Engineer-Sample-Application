@@ -139,7 +139,7 @@ The full set of tables, columns, types, and foreign keys is captured in the ER d
 - **`refresh_tokens`** back the session/token-theft mitigations in §3.2: each row is a single-use, rotating refresh token stored hashed (never plaintext), with `expires_at` and `revoked_at`. Revoking a user's sessions (e.g. on password change) means setting `revoked_at` on their active rows here — the short-lived JWT access token itself is never persisted or revocable.
 - **No table ever stores a full card number, CVV, or expiration date.** Only the processor's opaque token (`payments.processor_card_token`) and display metadata (`card_last4`, `card_brand`) are persisted, consistent with basic PCI-DSS scope reduction.
 
-GitHub's Mermaid renderer reproducibly fails ("Unable to render rich display") on the single 13-entity version of this diagram this document used to have — a size/complexity limit in that sandboxed renderer rather than a syntax error (the full diagram parses and renders correctly under mermaid 9.4.3 through 11.4.0 tested directly, and it isn't a transient glitch — it fails consistently on reload). Splitting it by domain into three smaller diagrams, none with more than 6 fully-detailed entities, keeps each comfortably under whatever that limit is. An entity listed without its column list in a diagram below is repeated only to anchor a cross-diagram relationship — its full definition lives in the diagram where it's the primary subject.
+GitHub's Mermaid renderer reproducibly fails on these diagrams — first with "Unable to render rich display" on the original single 13-entity version, then with "svg element not in render tree" even after splitting it by domain. The second error is a known Mermaid text-measurement regression (mermaid-js/mermaid#4280) triggered by an entity whose attribute rows mix some with a quoted comment and some without — mermaid tries to measure an "empty" comment cell for the rows lacking one and the layout step throws. Every entity below used to have exactly that mix (e.g. `id id PK` alongside `enum role "customer, admin, customer_service"`). The fix is to give every attribute row a comment so none is implicitly empty. An entity listed without its column list in a diagram below is repeated only to anchor a cross-diagram relationship — its full definition lives in the diagram where it's the primary subject.
 
 ### 5.1 Proposed ER Diagram — Users & Catalog
 
@@ -153,62 +153,62 @@ erDiagram
     WIDGETS ||--o{ CART_ITEMS : "referenced by"
 
     USERS {
-        id id PK
-        string email UK
-        string password_hash
-        string full_name
+        id id PK "primary key"
+        string email UK "login identifier"
+        string password_hash "bcrypt/argon2 hash"
+        string full_name "display name"
         enum role "customer, admin, customer_service"
         int failed_login_attempts "default 0"
         timestamp locked_until "nullable"
-        timestamp created_at
+        timestamp created_at "account creation time"
     }
 
     ADDRESSES {
-        id id PK
-        id user_id FK
-        string line1
-        string line2
-        string city
-        string state
-        string postal_code
-        string country
-        bool is_default_shipping
-        bool is_default_billing
+        id id PK "primary key"
+        id user_id FK "owning user"
+        string line1 "street address line 1"
+        string line2 "street address line 2, optional"
+        string city "city"
+        string state "state/province"
+        string postal_code "postal/zip code"
+        string country "country"
+        bool is_default_shipping "default shipping address flag"
+        bool is_default_billing "default billing address flag"
     }
 
     CATEGORIES {
-        id id PK
-        string name UK
+        id id PK "primary key"
+        string name UK "category name"
     }
 
     WIDGETS {
-        id id PK
-        string sku UK
-        string name
-        text description
-        int price_cents
-        string currency
-        int stock_quantity
-        id category_id FK
-        string image_url
-        bool is_active
-        id created_by FK
-        id updated_by FK
-        timestamp created_at
-        timestamp updated_at
+        id id PK "primary key"
+        string sku UK "stock keeping unit"
+        string name "widget name"
+        text description "widget description"
+        int price_cents "current price, set by admin"
+        string currency "default USD"
+        int stock_quantity "units in stock"
+        id category_id FK "nullable"
+        string image_url "product image"
+        bool is_active "soft delisting flag"
+        id created_by FK "admin who created this widget"
+        id updated_by FK "admin who last updated this widget"
+        timestamp created_at "creation time"
+        timestamp updated_at "last update time"
     }
 
     CARTS {
-        id id PK
-        id user_id FK
+        id id PK "primary key"
+        id user_id FK "cart owner"
     }
 
     CART_ITEMS {
-        id id PK
-        id cart_id FK
-        id widget_id FK
-        int quantity
-        int unit_price_cents
+        id id PK "primary key"
+        id cart_id FK "parent cart"
+        id widget_id FK "widget being purchased"
+        int quantity "quantity requested"
+        int unit_price_cents "re-priced at checkout"
     }
 ```
 
@@ -229,59 +229,59 @@ erDiagram
     WIDGETS ||--o{ EXCHANGES : "returned/replacement item"
 
     ORDERS {
-        id id PK
-        id user_id FK
+        id id PK "primary key"
+        id user_id FK "purchasing customer"
         enum status "pending_payment, paid, refunded, partially_refunded, exchange_pending, exchanged, cancelled"
-        int subtotal_cents
-        int total_cents
-        id shipping_address_id FK
-        id payment_id FK
-        timestamp created_at
+        int subtotal_cents "sum of line items"
+        int total_cents "subtotal plus any adjustments"
+        id shipping_address_id FK "delivery address"
+        id payment_id FK "associated payment"
+        timestamp created_at "order placed time"
     }
 
     ORDER_ITEMS {
-        id id PK
-        id order_id FK
-        id widget_id FK
-        int quantity
-        int unit_price_cents "immutable"
+        id id PK "primary key"
+        id order_id FK "parent order"
+        id widget_id FK "widget purchased"
+        int quantity "quantity purchased"
+        int unit_price_cents "immutable, price at purchase time"
     }
 
     PAYMENTS {
-        id id PK
-        id order_id FK
-        string processor_transaction_id
-        string processor_card_token
-        int amount_cents
+        id id PK "primary key"
+        id order_id FK "associated order"
+        string processor_transaction_id "id returned by the payment processor"
+        string processor_card_token "tokenized card reference, never raw PAN"
+        int amount_cents "amount charged"
         enum status "authorized, captured, failed, refunded, partially_refunded"
-        string card_last4
-        string card_brand
-        timestamp created_at
+        string card_last4 "display only, from processor response"
+        string card_brand "display only, from processor response"
+        timestamp created_at "charge time"
     }
 
     REFUNDS {
-        id id PK
-        id order_id FK
-        id payment_id FK
-        id issued_by FK
-        int amount_cents
-        text reason
-        string processor_refund_id
-        timestamp created_at
+        id id PK "primary key"
+        id order_id FK "refunded order"
+        id payment_id FK "refunded payment"
+        id issued_by FK "CS agent who issued the refund"
+        int amount_cents "refund amount"
+        text reason "reason for refund"
+        string processor_refund_id "id returned by the payment processor"
+        timestamp created_at "refund time"
     }
 
     EXCHANGES {
-        id id PK
-        id order_id FK
-        id processed_by FK
-        id returned_widget_id FK
-        int returned_quantity
-        id replacement_widget_id FK
-        int replacement_quantity
+        id id PK "primary key"
+        id order_id FK "original order"
+        id processed_by FK "CS agent who processed the exchange"
+        id returned_widget_id FK "item sent back"
+        int returned_quantity "quantity returned"
+        id replacement_widget_id FK "item shipped instead"
+        int replacement_quantity "quantity shipped"
         enum status "requested, received, completed, rejected"
-        text notes
-        timestamp created_at
-        timestamp updated_at
+        text notes "internal notes"
+        timestamp created_at "exchange requested time"
+        timestamp updated_at "last status update time"
     }
 ```
 
@@ -295,22 +295,22 @@ erDiagram
     USERS ||--o{ REFRESH_TOKENS : "authenticates via"
 
     PASSWORD_RESET_TOKENS {
-        id id PK
-        id user_id FK
-        string token_hash
-        timestamp expires_at
-        timestamp used_at
-        timestamp created_at
+        id id PK "primary key"
+        id user_id FK "requesting user"
+        string token_hash "hashed, never plaintext"
+        timestamp expires_at "single-use, time-limited"
+        timestamp used_at "nullable, set when redeemed"
+        timestamp created_at "request time"
     }
 
     REFRESH_TOKENS {
-        id id PK
-        id user_id FK
-        string token_hash
+        id id PK "primary key"
+        id user_id FK "authenticated user"
+        string token_hash "hashed, never plaintext"
         id replaced_by FK "nullable, points to rotated successor"
-        timestamp expires_at
+        timestamp expires_at "token expiry"
         timestamp revoked_at "nullable"
-        timestamp created_at
+        timestamp created_at "issued time"
     }
 ```
 
