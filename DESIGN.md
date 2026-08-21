@@ -12,7 +12,7 @@ The app is a **Single Page Application (SPA)** frontend backed by a **REST API**
 
 **Goals**
 
-- Realistic, small-scope e-commerce app: auth, catalog, cart, checkout, order history, refunds/exchanges.
+- Small-scope e-commerce app: auth, catalog, cart, checkout, order history, refunds/exchanges.
 - Clear separation of roles: Customer, Admin, Customer Service.
 - Simple enough to reason about end-to-end (schema, API, UI).
 - Integration with a real external payment processor's API surface (tokenization, charge, refund).
