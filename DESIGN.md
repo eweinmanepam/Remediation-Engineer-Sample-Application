@@ -215,6 +215,149 @@ Admin and CS accounts are internal/staff accounts, not self-service registration
 
 **No table ever stores a full card number, CVV, or expiration date.** Only the processor's opaque token and display metadata (last4, brand) are persisted, consistent with basic PCI-DSS scope reduction.
 
+### 5.1 Proposed ER Diagram
+
+```mermaid
+erDiagram
+    USERS ||--o{ ADDRESSES : owns
+    USERS ||--o{ CARTS : owns
+    USERS ||--o{ ORDERS : places
+    USERS ||--o{ REFUNDS : "issues (CS)"
+    USERS ||--o{ EXCHANGES : "processes (CS)"
+
+    CATEGORIES ||--o{ WIDGETS : categorizes
+    USERS ||--o{ WIDGETS : "created/updated by (admin)"
+
+    CARTS ||--o{ CART_ITEMS : contains
+    WIDGETS ||--o{ CART_ITEMS : "referenced by"
+
+    ADDRESSES ||--o{ ORDERS : "ships to"
+    ORDERS ||--o{ ORDER_ITEMS : contains
+    WIDGETS ||--o{ ORDER_ITEMS : "referenced by"
+
+    ORDERS ||--o| PAYMENTS : "paid via"
+    PAYMENTS ||--o{ REFUNDS : "refunded via"
+    ORDERS ||--o{ REFUNDS : "refunded on"
+
+    ORDERS ||--o{ EXCHANGES : "exchanged on"
+    WIDGETS ||--o{ EXCHANGES : "returned/replacement item"
+
+    USERS {
+        id id PK
+        string email UK
+        string password_hash
+        string full_name
+        enum role "customer, admin, customer_service"
+        timestamp created_at
+    }
+
+    ADDRESSES {
+        id id PK
+        id user_id FK
+        string line1
+        string line2
+        string city
+        string state
+        string postal_code
+        string country
+        bool is_default_shipping
+        bool is_default_billing
+    }
+
+    CATEGORIES {
+        id id PK
+        string name UK
+    }
+
+    WIDGETS {
+        id id PK
+        string sku UK
+        string name
+        text description
+        int price_cents
+        string currency
+        int stock_quantity
+        id category_id FK
+        string image_url
+        bool is_active
+        id created_by FK
+        id updated_by FK
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    CARTS {
+        id id PK
+        id user_id FK
+    }
+
+    CART_ITEMS {
+        id id PK
+        id cart_id FK
+        id widget_id FK
+        int quantity
+        int unit_price_cents
+    }
+
+    ORDERS {
+        id id PK
+        id user_id FK
+        enum status "pending_payment, paid, refunded, partially_refunded, exchange_pending, exchanged, cancelled"
+        int subtotal_cents
+        int total_cents
+        id shipping_address_id FK
+        id payment_id FK
+        timestamp created_at
+    }
+
+    ORDER_ITEMS {
+        id id PK
+        id order_id FK
+        id widget_id FK
+        int quantity
+        int unit_price_cents "immutable"
+    }
+
+    PAYMENTS {
+        id id PK
+        id order_id FK
+        string processor_transaction_id
+        string processor_card_token
+        int amount_cents
+        enum status "authorized, captured, failed, refunded, partially_refunded"
+        string card_last4
+        string card_brand
+        timestamp created_at
+    }
+
+    REFUNDS {
+        id id PK
+        id order_id FK
+        id payment_id FK
+        id issued_by FK
+        int amount_cents
+        text reason
+        string processor_refund_id
+        timestamp created_at
+    }
+
+    EXCHANGES {
+        id id PK
+        id order_id FK
+        id processed_by FK
+        id returned_widget_id FK
+        int returned_quantity
+        id replacement_widget_id FK
+        int replacement_quantity
+        enum status "requested, received, completed, rejected"
+        text notes
+        timestamp created_at
+        timestamp updated_at
+    }
+```
+
+This diagram is a direct rendering of the tables and foreign keys defined above (§5); it does not introduce any structure not already specified there.
+
 ---
 
 ## 6. Payment Processor Integration
