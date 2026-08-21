@@ -53,18 +53,9 @@ flowchart TB
     end
 
     subgraph dockerhost["Docker Compose Environment (our infrastructure)"]
-        subgraph webc["web container"]
-            spa["SPA (React)\nstatic build served via nginx"]
-        end
-
-        subgraph apic["api container"]
-            api["REST API (Node.js / Express)\nauthN/authZ, business logic"]
-        end
-
-        subgraph dbc["db container"]
-            db[("SQL Database\nPostgreSQL")]
-        end
-
+        spa["web container\nSPA (React), static build served via nginx"]
+        api["api container\nREST API (Node.js / Express), authN/authZ, business logic"]
+        db[("db container\nSQL Database, PostgreSQL")]
         migrate["migrate (one-shot)\nruns schema migrations/seed"]
     end
 
@@ -85,7 +76,7 @@ flowchart TB
     migrate -.->|"must complete before api serves traffic"| api
 
     style processor fill:#fee,stroke:#900
-    style dbc fill:#eef,stroke:#339
+    style db fill:#eef,stroke:#339
 ```
 
 Key architectural points from this document:
