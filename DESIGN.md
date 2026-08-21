@@ -6,19 +6,19 @@ Widget Shop is a small e-commerce application. It lets customers register, brows
 
 The app is a **Single Page Application (SPA)** frontend backed by a **REST API**, with a **SQL database** for persistence, and is deployed as a set of **Docker containers**.
 
-This document defines the data model, API surface, roles, and flows needed to build the application end to end. A few low-level implementation choices (exact ORM, specific library versions, internal code organization) are left to the engineering team building each service, but the structure here is complete enough to implement directly.
-
 ---
 
 ## 2. Goals / Non-Goals
 
 **Goals**
+
 - Realistic, small-scope e-commerce app: auth, catalog, cart, checkout, order history, refunds/exchanges.
 - Clear separation of roles: Customer, Admin, Customer Service.
 - Simple enough to reason about end-to-end (schema, API, UI).
 - Integration with a real external payment processor's API surface (tokenization, charge, refund).
 
 **Non-Goals**
+
 - No PCI compliance program to build/audit ourselves — card data is tokenized directly with the processor, minimizing our PCI scope.
 - No multi-tenancy, internationalization, tax calculation, or shipping-carrier integration.
 - No high-availability / multi-region scaling in this phase — a single-region deployment is sufficient for current business volume.
@@ -27,15 +27,15 @@ This document defines the data model, API surface, roles, and flows needed to bu
 
 ## 3. Tech Stack
 
-| Layer | Choice |
-|---|---|
-| Frontend | SPA (React or similar), calling the backend via JSON REST API |
-| Backend | Node.js API server (e.g. Express) |
-| Database | SQL (PostgreSQL or SQLite for local/dev) via an ORM/query builder |
-| Auth | Short-lived JWT access tokens (held in-memory client-side) + rotating opaque refresh tokens in an `HttpOnly`/`Secure`/`SameSite` cookie (see §3.2); password hashing (bcrypt/argon2) |
-| Email | Transactional email provider (SMTP relay or API), used to deliver password-reset links |
-| Payments | Real external payment processor (e.g. Stripe-style gateway), accessed over HTTPS via a thin client module |
-| Deployment | Docker containers, orchestrated via Docker Compose |
+| Layer      | Choice                                                                                                                                                                               |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Frontend   | SPA (React or similar), calling the backend via JSON REST API                                                                                                                        |
+| Backend    | Node.js API server (e.g. Express)                                                                                                                                                    |
+| Database   | SQL (PostgreSQL or SQLite for local/dev) via an ORM/query builder                                                                                                                    |
+| Auth       | Short-lived JWT access tokens (held in-memory client-side) + rotating opaque refresh tokens in an `HttpOnly`/`Secure`/`SameSite` cookie (see §3.2); password hashing (bcrypt/argon2) |
+| Email      | Transactional email provider (SMTP relay or API), used to deliver password-reset links                                                                                               |
+| Payments   | Real external payment processor (e.g. Stripe-style gateway), accessed over HTTPS via a thin client module                                                                            |
+| Deployment | Docker containers, orchestrated via Docker Compose                                                                                                                                   |
 
 ---
 
@@ -89,6 +89,7 @@ flowchart TB
 ```
 
 Key architectural points from this document:
+
 - The SPA never routes raw card data through the API (§6) — it goes browser → payment processor directly, returning only an opaque `card_token`.
 - The payment processor is an **external system outside our trust boundary**, reached over the public internet — not a container we operate (§11.1).
 - The API is the sole client of the database and is the actual authorization boundary (§4) even though the SPA also hides unauthorized UI.
@@ -101,22 +102,22 @@ Key architectural points from this document:
 
 Storing a JWT somewhere the client-side JavaScript can read it (`localStorage`, `sessionStorage`, or a non-`HttpOnly` cookie) means any successful XSS on the SPA can exfiltrate it — the token then works from anywhere, for as long as it's valid, with no way for the server to tell the difference from the real user. To close that off, the app splits authentication into two tokens with different exposure and lifetimes:
 
-- **Access token**: a short-lived (e.g. 15 minute) JWT returned in the login/refresh response *body*. The SPA keeps it only in memory (a JS variable, scoped to the running tab) — never written to `localStorage`, `sessionStorage`, or any other persistent client-side store. It doesn't survive a page reload and isn't a standing target for exfiltration; even if it's read via XSS, its blast radius is capped at ~15 minutes.
-- **Refresh token**: an opaque, random, single-use token delivered *exclusively* via an `HttpOnly`, `Secure`, `SameSite=Strict` cookie. Because it's `HttpOnly`, injected JavaScript can never read it — the primary XSS token-theft vector doesn't apply to it. The server stores only a hash of it (`refresh_tokens`, see §5), never the plaintext.
+- **Access token**: a short-lived (e.g. 15 minute) JWT returned in the login/refresh response _body_. The SPA keeps it only in memory (a JS variable, scoped to the running tab) — never written to `localStorage`, `sessionStorage`, or any other persistent client-side store. It doesn't survive a page reload and isn't a standing target for exfiltration; even if it's read via XSS, its blast radius is capped at ~15 minutes.
+- **Refresh token**: an opaque, random, single-use token delivered _exclusively_ via an `HttpOnly`, `Secure`, `SameSite=Strict` cookie. Because it's `HttpOnly`, injected JavaScript can never read it — the primary XSS token-theft vector doesn't apply to it. The server stores only a hash of it (`refresh_tokens`, see §5), never the plaintext.
 - **Refresh & rotation**: `POST /api/auth/refresh` authenticates purely off the cookie (no token in the request body) and returns a new access token. Every refresh **rotates** the refresh token: the presented one is marked used and a new one is issued. If an already-used refresh token is ever presented again, that's a signal it was stolen and replayed — the server revokes the entire token family and forces re-login.
 - **CSRF on the refresh endpoint**: since it's cookie-authenticated, `POST /api/auth/refresh` (and any other cookie-authenticated endpoint) additionally requires a custom header (e.g. `X-Requested-With`) that a cross-site form or `<img>`/`<form>` CSRF attempt cannot attach — defense in depth alongside `SameSite=Strict`.
 - **Revocation**: wherever this document says a flow "invalidates the user's other active sessions" (§7.1a Forgot/Reset Password, §7.1b Change Password), that means revoking the corresponding rows in `refresh_tokens`. A stateless JWT access token can't be revoked before it expires on its own, so every session-termination guarantee in this document is backed by the refresh-token table, not the access token.
-- **Defense in depth**: a strict Content-Security-Policy (no `unsafe-inline`, no `unsafe-eval`) is applied SPA-wide to reduce the underlying XSS risk in the first place — the token-handling design above is what limits the damage *if* that's ever bypassed, not a substitute for it.
+- **Defense in depth**: a strict Content-Security-Policy (no `unsafe-inline`, no `unsafe-eval`) is applied SPA-wide to reduce the underlying XSS risk in the first place — the token-handling design above is what limits the damage _if_ that's ever bypassed, not a substitute for it.
 
 ---
 
 ## 4. Roles & Permissions
 
-| Role | Capabilities |
-|---|---|
-| **Guest** | Browse catalog, view widget details, register, log in |
-| **Customer** | Everything Guest can do, plus: manage own profile/addresses, manage cart, checkout, view own order history, request a return/exchange |
-| **Admin** | Manage catalog (create/edit/delete widgets, set prices, manage inventory/stock), manage widget categories, view all orders (read-only), manage user role assignments |
+| Role                      | Capabilities                                                                                                                                                                                    |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Guest**                 | Browse catalog, view widget details, register, log in                                                                                                                                           |
+| **Customer**              | Everything Guest can do, plus: manage own profile/addresses, manage cart, checkout, view own order history, request a return/exchange                                                           |
+| **Admin**                 | Manage catalog (create/edit/delete widgets, set prices, manage inventory/stock), manage widget categories, view all orders (read-only), manage user role assignments                            |
 | **Customer Service (CS)** | View all orders and customers, issue refunds (full/partial) against an order/payment, process exchanges (accept returned item, ship replacement / adjust order), add internal notes to an order |
 
 Role checks are enforced **server-side** on every API endpoint — the SPA hides UI it shouldn't show, but the API is the actual authorization boundary.
@@ -333,10 +334,12 @@ This integration surface is intentionally modeled on how real gateways work (cli
 ## 7. Key Flows
 
 ### 7.1 Registration / Login
+
 1. Guest submits email/password (+ name) → server hashes password, creates `users` row with role `customer`.
 2. Login validates credentials, then issues a short-lived JWT access token (returned in the response body) and a rotating refresh token (set as an `HttpOnly`/`Secure`/`SameSite` cookie) — see §3.2 for why the two tokens are handled differently. See §7.1c for the account-lockout behavior applied on repeated failures.
 
 ### 7.1a Forgot / Reset Password
+
 1. Guest submits their email on a "forgot password" form.
 2. Server looks up the user; regardless of whether a match is found, it returns the same generic response (to avoid leaking which emails are registered).
 3. If a match is found, server generates a single-use, time-limited reset token, stores only its hash in `password_reset_tokens` (with `expires_at`), and emails a reset link containing the plaintext token to the user's registered email address via the transactional email provider.
@@ -344,12 +347,14 @@ This integration surface is intentionally modeled on how real gateways work (cli
 5. Server validates the token (exists, unexpired, unused), hashes the new password, updates `users.password_hash`, marks the token used, and revokes all of the user's `refresh_tokens` (§3.2) so any existing sessions — including one an attacker may have obtained — are logged out.
 
 ### 7.1b Change Password
+
 1. Authenticated customer submits their current password and a new password from their account settings.
 2. Server re-verifies the current password against `users.password_hash` before allowing the change (prevents a hijacked session with a stolen token/cookie, but no credentials, from silently taking over the account).
 3. On success: server hashes and stores the new password, and revokes all of the user's `refresh_tokens` (§3.2) other than the one backing the current session.
 4. On failure (current password incorrect): request rejected, password unchanged.
 
 ### 7.1c Account Lockout / Login
+
 1. Login request arrives with email + password.
 2. Server looks up the user and first checks `locked_until`: if it's set and still in the future, the request is rejected immediately (generic "account temporarily locked, try again later" response) — the password is not checked.
 3. Otherwise, server verifies the password:
@@ -357,9 +362,11 @@ This integration surface is intentionally modeled on how real gateways work (cli
    - **Correct**: reset `failed_login_attempts` to 0, clear `locked_until`, issue an access token + refresh-token cookie as in §7.1/§3.2.
 
 ### 7.2 Browse Catalog
+
 - Public endpoint lists active widgets, filterable by category, searchable by name; widget detail view shows description/price/stock.
 
 ### 7.3 Cart & Checkout
+
 1. Authenticated customer adds/updates/removes items in their cart.
 2. On checkout: customer supplies shipping address and card details (entered directly into a payment-processor-hosted field/component in the SPA → tokenized client-side).
 3. SPA sends `card_token` + cart + shipping address to backend `POST /orders`.
@@ -368,16 +375,19 @@ This integration surface is intentionally modeled on how real gateways work (cli
 6. On failure: order marked failed/cancelled, customer notified, cart preserved.
 
 ### 7.4 Admin — Catalog Management
+
 - Admin creates/edits widgets (name, description, price, stock, category, image, active flag).
 - Price changes only affect future carts/orders (existing `order_items.unit_price_cents` are immutable history).
 
 ### 7.5 Customer Service — Refunds
+
 1. CS looks up an order (by order id, customer email, etc.).
 2. CS issues a full or partial refund with a reason.
 3. Backend calls the payment processor `/refund` for `amount_cents` against the original `processor_transaction_id`.
 4. On success: create `refunds` row, update `payments.status` and `orders.status` (`refunded`/`partially_refunded`).
 
 ### 7.6 Customer Service — Exchanges
+
 1. Customer (or CS on their behalf) requests an exchange on a delivered order, specifying returned item(s) and desired replacement.
 2. CS marks the return `received` once the item is physically back.
 3. CS completes the exchange: system creates/updates the replacement shipment; if replacement price differs from returned item, CS issues a partial refund or requests an additional payment (via a new charge through the payment processor) to settle the difference.
@@ -418,7 +428,7 @@ sequenceDiagram
     SPA-->>Guest: Logged in
 ```
 
-*(See §3.2 for why the access token stays in memory while the refresh token lives only in an `HttpOnly` cookie.)*
+_(See §3.2 for why the access token stays in memory while the refresh token lives only in an `HttpOnly` cookie.)_
 
 ### 7.7.2 Browse Catalog (§7.2)
 
@@ -819,12 +829,12 @@ The application ships as a small set of containers, defined via a `docker-compos
 
 ### 11.1 Containers
 
-| Service | Image / Base | Notes |
-|---|---|---|
-| `web` | `node:XX-alpine` (multi-stage build) | Builds and serves the SPA (static build output served via nginx or a lightweight Node static server) |
-| `api` | `node:XX-alpine` (multi-stage build) | Express API server |
-| `db` | `postgres:XX-alpine` | SQL database, named volume for data persistence |
-| `migrate` (optional, one-shot) | same image as `api` | Runs DB migrations/seed on startup, then exits |
+| Service                        | Image / Base                         | Notes                                                                                                |
+| ------------------------------ | ------------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| `web`                          | `node:XX-alpine` (multi-stage build) | Builds and serves the SPA (static build output served via nginx or a lightweight Node static server) |
+| `api`                          | `node:XX-alpine` (multi-stage build) | Express API server                                                                                   |
+| `db`                           | `postgres:XX-alpine`                 | SQL database, named volume for data persistence                                                      |
+| `migrate` (optional, one-shot) | same image as `api`                  | Runs DB migrations/seed on startup, then exits                                                       |
 
 The **payment processor is not a container in this Compose stack** — it is a real, external, third-party service reached over the public internet via HTTPS. Only `api` (server-to-server) and the browser running the SPA (for client-side tokenization) talk to it; nothing about it is deployed or operated by us.
 
@@ -865,7 +875,7 @@ services:
 
   api:
     build: ./api
-    env_file: .env               # includes PAYMENT_PROCESSOR_BASE_URL / API key
+    env_file: .env # includes PAYMENT_PROCESSOR_BASE_URL / API key
     depends_on:
       db: { condition: service_healthy }
     expose: ["3000"]
@@ -891,7 +901,7 @@ volumes:
   db_data:
 ```
 
-*(The payment processor is external and has no service entry here — `api` reaches it via `PAYMENT_PROCESSOR_BASE_URL` over the public internet.)*
+_(The payment processor is external and has no service entry here — `api` reaches it via `PAYMENT_PROCESSOR_BASE_URL` over the public internet.)_
 
 ### 11.7 Deployment-Related Requirements
 
