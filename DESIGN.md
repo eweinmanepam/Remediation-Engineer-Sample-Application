@@ -32,7 +32,7 @@ This document intentionally leaves some implementation details open (they are fi
 | Frontend | SPA (React or similar), calling the backend via JSON REST API |
 | Backend | Node.js API server (e.g. Express) |
 | Database | SQL (PostgreSQL or SQLite for local/dev) via an ORM/query builder |
-| Auth | Session- or JWT-based auth, password hashing (bcrypt/argon2) |
+| Auth | Short-lived JWT access tokens (held in-memory client-side) + rotating opaque refresh tokens in an `HttpOnly`/`Secure`/`SameSite` cookie (see §3.2); password hashing (bcrypt/argon2) |
 | Email | Transactional email provider (SMTP relay or API), used to deliver password-reset links |
 | Payments | Real external payment processor (e.g. Stripe-style gateway), accessed over HTTPS via a thin client module |
 | Deployment | Docker containers, orchestrated via Docker Compose |
@@ -97,6 +97,19 @@ Key architectural points from this document:
 
 ---
 
+## 3.2 Session & Token Security
+
+Storing a JWT somewhere the client-side JavaScript can read it (`localStorage`, `sessionStorage`, or a non-`HttpOnly` cookie) means any successful XSS on the SPA can exfiltrate it — the token then works from anywhere, for as long as it's valid, with no way for the server to tell the difference from the real user. To close that off, the app splits authentication into two tokens with different exposure and lifetimes:
+
+- **Access token**: a short-lived (e.g. 15 minute) JWT returned in the login/refresh response *body*. The SPA keeps it only in memory (a JS variable, scoped to the running tab) — never written to `localStorage`, `sessionStorage`, or any other persistent client-side store. It doesn't survive a page reload and isn't a standing target for exfiltration; even if it's read via XSS, its blast radius is capped at ~15 minutes.
+- **Refresh token**: an opaque, random, single-use token delivered *exclusively* via an `HttpOnly`, `Secure`, `SameSite=Strict` cookie. Because it's `HttpOnly`, injected JavaScript can never read it — the primary XSS token-theft vector doesn't apply to it. The server stores only a hash of it (`refresh_tokens`, see §5), never the plaintext.
+- **Refresh & rotation**: `POST /api/auth/refresh` authenticates purely off the cookie (no token in the request body) and returns a new access token. Every refresh **rotates** the refresh token: the presented one is marked used and a new one is issued. If an already-used refresh token is ever presented again, that's a signal it was stolen and replayed — the server revokes the entire token family and forces re-login.
+- **CSRF on the refresh endpoint**: since it's cookie-authenticated, `POST /api/auth/refresh` (and any other cookie-authenticated endpoint) additionally requires a custom header (e.g. `X-Requested-With`) that a cross-site form or `<img>`/`<form>` CSRF attempt cannot attach — defense in depth alongside `SameSite=Strict`.
+- **Revocation**: wherever this document says a flow "invalidates the user's other active sessions" (§7.1a Forgot/Reset Password, §7.1b Change Password), that means revoking the corresponding rows in `refresh_tokens`. A stateless JWT access token can't be revoked before it expires on its own, so every session-termination guarantee in this document is backed by the refresh-token table, not the access token.
+- **Defense in depth**: a strict Content-Security-Policy (no `unsafe-inline`, no `unsafe-eval`) is applied SPA-wide to reduce the underlying XSS risk in the first place — the token-handling design above is what limits the damage *if* that's ever bypassed, not a substitute for it.
+
+---
+
 ## 4. Roles & Permissions
 
 | Role | Capabilities |
@@ -123,6 +136,7 @@ The full set of tables, columns, types, and foreign keys is captured in the ER d
 - **`order_items.unit_price_cents`** is immutable once set — it is the price at time of purchase and is never affected by later catalog price changes.
 - **`password_reset_tokens`** are single-use and time-limited: a token is stored hashed (never plaintext), carries an `expires_at`, and is marked used (or deleted) the moment it's redeemed or superseded by a newer request.
 - **`users.failed_login_attempts` / `locked_until`** implement account lockout: consecutive failed logins increment the counter; reaching a configured threshold sets `locked_until` (a cooldown period) and further login attempts are rejected until it elapses. A successful login resets the counter.
+- **`refresh_tokens`** back the session/token-theft mitigations in §3.2: each row is a single-use, rotating refresh token stored hashed (never plaintext), with `expires_at` and `revoked_at`. Revoking a user's sessions (e.g. on password change) means setting `revoked_at` on their active rows here — the short-lived JWT access token itself is never persisted or revocable.
 - **No table ever stores a full card number, CVV, or expiration date.** Only the processor's opaque token (`payments.processor_card_token`) and display metadata (`card_last4`, `card_brand`) are persisted, consistent with basic PCI-DSS scope reduction.
 
 ### 5.1 Proposed ER Diagram
@@ -135,6 +149,7 @@ erDiagram
     USERS ||--o{ REFUNDS : "issues (CS)"
     USERS ||--o{ EXCHANGES : "processes (CS)"
     USERS ||--o{ PASSWORD_RESET_TOKENS : requests
+    USERS ||--o{ REFRESH_TOKENS : "authenticates via"
 
     CATEGORIES ||--o{ WIDGETS : categorizes
     USERS ||--o{ WIDGETS : "created/updated by (admin)"
@@ -276,6 +291,16 @@ erDiagram
         timestamp used_at
         timestamp created_at
     }
+
+    REFRESH_TOKENS {
+        id id PK
+        id user_id FK
+        string token_hash
+        id replaced_by FK "nullable, points to rotated successor"
+        timestamp expires_at
+        timestamp revoked_at "nullable"
+        timestamp created_at
+    }
 ```
 
 This diagram is a direct rendering of the tables and foreign keys defined above (§5); it does not introduce any structure not already specified there.
@@ -298,19 +323,19 @@ This integration surface is intentionally modeled on how real gateways work (cli
 
 ### 7.1 Registration / Login
 1. Guest submits email/password (+ name) → server hashes password, creates `users` row with role `customer`.
-2. Login validates credentials, issues session/JWT. See §7.1c for the account-lockout behavior applied on repeated failures.
+2. Login validates credentials, then issues a short-lived JWT access token (returned in the response body) and a rotating refresh token (set as an `HttpOnly`/`Secure`/`SameSite` cookie) — see §3.2 for why the two tokens are handled differently. See §7.1c for the account-lockout behavior applied on repeated failures.
 
 ### 7.1a Forgot / Reset Password
 1. Guest submits their email on a "forgot password" form.
 2. Server looks up the user; regardless of whether a match is found, it returns the same generic response (to avoid leaking which emails are registered).
 3. If a match is found, server generates a single-use, time-limited reset token, stores only its hash in `password_reset_tokens` (with `expires_at`), and emails a reset link containing the plaintext token to the user's registered email address via the transactional email provider.
 4. User follows the link, submits a new password (+ the token from the link).
-5. Server validates the token (exists, unexpired, unused), hashes the new password, updates `users.password_hash`, marks the token used, and invalidates the user's other active sessions.
+5. Server validates the token (exists, unexpired, unused), hashes the new password, updates `users.password_hash`, marks the token used, and revokes all of the user's `refresh_tokens` (§3.2) so any existing sessions — including one an attacker may have obtained — are logged out.
 
 ### 7.1b Change Password
 1. Authenticated customer submits their current password and a new password from their account settings.
 2. Server re-verifies the current password against `users.password_hash` before allowing the change (prevents a hijacked session with a stolen token/cookie, but no credentials, from silently taking over the account).
-3. On success: server hashes and stores the new password, and invalidates the user's other active sessions.
+3. On success: server hashes and stores the new password, and revokes all of the user's `refresh_tokens` (§3.2) other than the one backing the current session.
 4. On failure (current password incorrect): request rejected, password unchanged.
 
 ### 7.1c Account Lockout / Login
@@ -318,7 +343,7 @@ This integration surface is intentionally modeled on how real gateways work (cli
 2. Server looks up the user and first checks `locked_until`: if it's set and still in the future, the request is rejected immediately (generic "account temporarily locked, try again later" response) — the password is not checked.
 3. Otherwise, server verifies the password:
    - **Incorrect**: increment `failed_login_attempts`. If the new count reaches the configured threshold (e.g. 5), set `locked_until` to now + a cooldown window (e.g. 15 minutes). Respond with a generic "invalid email or password" error either way (the account-locked message is only shown once the threshold is actually hit, on that same response).
-   - **Correct**: reset `failed_login_attempts` to 0, clear `locked_until`, issue a session/JWT.
+   - **Correct**: reset `failed_login_attempts` to 0, clear `locked_until`, issue an access token + refresh-token cookie as in §7.1/§3.2.
 
 ### 7.2 Browse Catalog
 - Public endpoint lists active widgets, filterable by category, searchable by name; widget detail view shows description/price/stock.
@@ -373,10 +398,16 @@ sequenceDiagram
     API->>DB: SELECT user by email
     DB-->>API: user row (password_hash)
     API->>API: Verify password hash
-    API->>API: Issue session/JWT
-    API-->>SPA: 200 OK + session/JWT
+    API->>API: Generate short-lived JWT access token
+    API->>API: Generate opaque refresh token, hash it
+    API->>DB: INSERT refresh_tokens {user_id, token_hash, expires_at}
+    DB-->>API: ack
+    API-->>SPA: 200 OK, access token in body + Set-Cookie refresh_token (HttpOnly, Secure, SameSite)
+    SPA->>SPA: Hold access token in memory only (never localStorage/sessionStorage)
     SPA-->>Guest: Logged in
 ```
+
+*(See §3.2 for why the access token stays in memory while the refresh token lives only in an `HttpOnly` cookie.)*
 
 ### 7.7.2 Browse Catalog (§7.2)
 
@@ -576,7 +607,7 @@ sequenceDiagram
         API->>API: Hash new password
         API->>DB: UPDATE users.password_hash
         API->>DB: UPDATE password_reset_tokens SET used_at=now
-        API->>DB: Invalidate user's other active sessions
+        API->>DB: UPDATE refresh_tokens SET revoked_at=now WHERE user_id=... (all sessions)
         DB-->>API: ack
         API-->>SPA: 200 OK (password reset)
         SPA-->>Guest: Redirect to login
@@ -597,15 +628,15 @@ sequenceDiagram
 
     Customer->>SPA: Submit current password + new password
     SPA->>API: POST /api/auth/change-password {current_password, new_password}
-    API->>API: Check authenticated session
-    API->>DB: SELECT user by session/JWT subject
+    API->>API: Verify access token (from Authorization header)
+    API->>DB: SELECT user by access token subject
     DB-->>API: user row (password_hash)
     API->>API: Verify current_password against password_hash
 
     alt current password correct
         API->>API: Hash new password
         API->>DB: UPDATE users.password_hash
-        API->>DB: Invalidate user's other active sessions
+        API->>DB: UPDATE refresh_tokens SET revoked_at=now WHERE user_id=... AND id != current session's
         DB-->>API: ack
         API-->>SPA: 200 OK (password changed)
         SPA-->>Customer: Confirmation
@@ -637,9 +668,10 @@ sequenceDiagram
 
         alt password correct
             API->>DB: UPDATE users SET failed_login_attempts=0, locked_until=NULL
-            API->>API: Issue session/JWT
+            API->>API: Issue access token + refresh token (§3.2)
+            API->>DB: INSERT refresh_tokens {user_id, token_hash, expires_at}
             DB-->>API: ack
-            API-->>SPA: 200 OK + session/JWT
+            API-->>SPA: 200 OK, access token in body + Set-Cookie refresh_token (HttpOnly, Secure, SameSite)
             SPA-->>User: Logged in
         else password incorrect
             API->>DB: UPDATE users SET failed_login_attempts += 1
@@ -658,6 +690,42 @@ sequenceDiagram
     end
 ```
 
+### 7.7.10 Token Refresh & Stolen-Token Detection (§3.2)
+
+```mermaid
+sequenceDiagram
+    actor User as Guest/Customer
+    participant SPA
+    participant API
+    participant DB
+
+    Note over SPA: Access token (in memory) has expired
+
+    SPA->>API: POST /api/auth/refresh (refresh_token cookie, no body)
+    API->>DB: SELECT refresh_tokens by token_hash
+
+    alt token not found, expired, or already revoked
+        DB-->>API: invalid/revoked/missing
+        API-->>SPA: 401 Unauthorized
+        SPA-->>User: Redirect to login
+    else token valid and unused
+        DB-->>API: token row
+        API->>API: Generate new access token
+        API->>API: Generate new opaque refresh token, hash it
+        API->>DB: INSERT new refresh_tokens row {replaces old id}
+        API->>DB: UPDATE old refresh_tokens SET revoked_at=now
+        DB-->>API: ack
+        API-->>SPA: 200 OK, new access token in body + Set-Cookie refresh_token (rotated)
+        SPA->>SPA: Replace in-memory access token
+    else token already used once before (reuse of a rotated-out token)
+        Note over API: Signals the token was likely stolen and replayed
+        API->>DB: UPDATE refresh_tokens SET revoked_at=now WHERE user_id=... (entire token family)
+        DB-->>API: ack
+        API-->>SPA: 401 Unauthorized
+        SPA-->>User: Force logout, redirect to login
+    end
+```
+
 ---
 
 ## 8. API Surface (representative, not exhaustive)
@@ -669,7 +737,8 @@ Auth
   POST   /api/auth/forgot-password   (request reset link, always generic response)
   POST   /api/auth/reset-password    (consume token, set new password)
   POST   /api/auth/change-password   (authenticated, requires current password)
-  POST   /api/auth/logout
+  POST   /api/auth/refresh           (cookie-authenticated, rotates refresh token, returns new access token)
+  POST   /api/auth/logout            (revokes the current refresh token)
 
 Catalog (public)
   GET    /api/widgets
@@ -722,10 +791,11 @@ All non-public endpoints require authentication; role-restricted endpoints addit
 11. Users can request a password reset email and set a new password via a single-use, time-limited link, without revealing whether a given email is registered.
 12. Authenticated users can change their password by re-confirming their current password.
 13. An account is temporarily locked out after a configured number of consecutive failed login attempts, and automatically unlocks after a cooldown period.
+14. A logged-in session survives beyond the short access-token lifetime via silent refresh, without ever exposing a long-lived credential to client-side JavaScript.
 
 ## 10. Non-Functional Requirements
 
-- **Security**: password hashing, parameterized SQL (no string-concatenated queries), server-side authZ on every endpoint, no raw card data at rest, HTTPS assumed in deployment. Password reset tokens are single-use, time-limited, stored hashed, and the forgot-password endpoint is rate-limited and returns a uniform response to avoid user enumeration. Login enforces account lockout after repeated failed attempts to slow down credential-stuffing/brute-force attacks.
+- **Security**: password hashing, parameterized SQL (no string-concatenated queries), server-side authZ on every endpoint, no raw card data at rest, HTTPS assumed in deployment. Password reset tokens are single-use, time-limited, stored hashed, and the forgot-password endpoint is rate-limited and returns a uniform response to avoid user enumeration. Login enforces account lockout after repeated failed attempts to slow down credential-stuffing/brute-force attacks. **Token theft**: the JWT access token is never persisted client-side (in-memory only, ~15 min lifetime); the refresh token that keeps the session alive is only ever exposed via an `HttpOnly`/`Secure`/`SameSite` cookie, is single-use with rotation, and reuse of an already-rotated refresh token revokes the whole session family as a theft signal (§3.2). A CSP restricting inline scripts limits the underlying XSS surface that this design assumes could otherwise be exploited.
 - **Data integrity**: order line items and prices are immutable once an order is placed; catalog price changes never retroactively alter past orders.
 - **Auditability**: refunds and exchanges record the acting staff user, timestamp, and reason.
 - **Testability**: the payment processor client is implemented behind an interface/module boundary so it can be pointed at the processor's sandbox/test mode, or replaced with a test double, for local development and automated tests — this is a testing concern and does not change the production architecture, which always talks to the real processor.
@@ -754,7 +824,7 @@ The **payment processor is not a container in this Compose stack** — it is a r
   - `api` is reachable from `web` and the host (for local dev), but in a hardened deployment only `web`/reverse-proxy would be published — `api` stays internal.
   - `db` is **not** published to the host; only `api` can reach it.
   - `api` requires outbound HTTPS access to the payment processor's public endpoints.
-- A reverse proxy (nginx/Traefik) container can front `web` + `api` under one origin to avoid CORS and to terminate TLS.
+- A reverse proxy (nginx/Traefik) container can front `web` + `api` under one origin to avoid CORS and to terminate TLS — this same one-origin setup is what makes `SameSite` cookie enforcement on the refresh-token cookie (§3.2) meaningful rather than merely nominal.
 
 ### 11.3 Configuration & Secrets
 
