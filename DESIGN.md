@@ -30,6 +30,7 @@ The app is a **Single Page Application (SPA)** frontend backed by a **REST API**
 | Layer      | Choice                                                                                                                                                                               |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Frontend   | SPA (React or similar), calling the backend via JSON REST API                                                                                                                        |
+| API Gateway | Single public entry point in front of `web` and `api` (§3.3): TLS termination, rate limiting, JWT authN/token validation                                                           |
 | Backend    | Node.js API server (e.g. Express)                                                                                                                                                    |
 | Database   | SQL (PostgreSQL or SQLite for local/dev) via an ORM/query builder                                                                                                                    |
 | Auth       | Short-lived JWT access tokens (held in-memory client-side) + rotating opaque refresh tokens in an `HttpOnly`/`Secure`/`SameSite` cookie (see §3.2); password hashing (bcrypt/argon2) |
@@ -41,7 +42,7 @@ The app is a **Single Page Application (SPA)** frontend backed by a **REST API**
 
 ## 3.1 Architecture Diagram
 
-The following diagram reflects the containers described in §3 and §11: a browser-hosted SPA, an API server backed by a SQL database, and a **real, third-party payment processor** that lives outside our infrastructure. The SPA talks to the processor directly for tokenization, and the API talks to it server-to-server for charges/refunds.
+The following diagram reflects the containers described in §3 and §11: a browser-hosted SPA, an API Gateway fronting the API, an API server backed by a SQL database, and a **real, third-party payment processor** that lives outside our infrastructure. All client traffic to our backend passes through the gateway; the SPA talks to the processor directly for tokenization, and the API talks to it server-to-server for charges/refunds.
 
 ```mermaid
 flowchart TB
@@ -53,20 +54,22 @@ flowchart TB
     end
 
     subgraph dockerhost["Docker Compose Environment (our infrastructure)"]
+        gateway["gateway container\nAPI Gateway: TLS termination,\nrate limiting, JWT authN/token validation"]
         spa["web container\nSPA (React), static build served via nginx"]
-        api["api container\nREST API (Node.js / Express), authN/authZ, business logic"]
+        api["api container\nREST API (Node.js / Express), business logic + authZ"]
         db[("db container\nSQL Database, PostgreSQL")]
         migrate["migrate (one-shot)\nruns schema migrations/seed"]
     end
 
     processor["Payment Processor\n(external third-party gateway,\ne.g. Stripe-style)"]
 
-    guest -->|HTTPS| spa
-    customer -->|HTTPS| spa
-    admin -->|HTTPS| spa
-    cs -->|HTTPS| spa
+    guest -->|HTTPS| gateway
+    customer -->|HTTPS| gateway
+    admin -->|HTTPS| gateway
+    cs -->|HTTPS| gateway
 
-    spa -->|"JSON REST API\n(auth, catalog, cart, orders)"| api
+    gateway -->|"static assets"| spa
+    gateway -->|"JSON REST API, rate limited +\nJWT validated (auth, catalog, cart, orders)"| api
     spa -->|"POST /tokenize\n(card details, direct from browser)"| processor
 
     api -->|"parameterized SQL"| db
@@ -77,13 +80,15 @@ flowchart TB
 
     style processor fill:#fee,stroke:#900
     style db fill:#eef,stroke:#339
+    style gateway fill:#ffe,stroke:#960
 ```
 
 Key architectural points from this document:
 
+- The **API Gateway is the sole public entry point** into our infrastructure (besides the payment processor's direct browser calls) — it terminates TLS, rate-limits requests, and validates the JWT access token before anything reaches `api` (§3.3). `api` and `web` are never directly reachable by clients (§11.2).
 - The SPA never routes raw card data through the API (§6) — it goes browser → payment processor directly, returning only an opaque `card_token`.
 - The payment processor is an **external system outside our trust boundary**, reached over the public internet — not a container we operate (§11.1).
-- The API is the sole client of the database and is the actual authorization boundary (§4) even though the SPA also hides unauthorized UI.
+- The API is the sole client of the database; the gateway enforces authentication (is this a valid token?) while the API enforces authorization (is this role allowed to do this?) (§4).
 - `db` is not published to the host; only `api` can reach it (§11.2).
 - `migrate` must complete before `api` accepts traffic (§11.4, §11.7.5).
 
@@ -99,6 +104,21 @@ Storing a JWT somewhere the client-side JavaScript can read it (`localStorage`, 
 - **CSRF on the refresh endpoint**: since it's cookie-authenticated, `POST /api/auth/refresh` (and any other cookie-authenticated endpoint) additionally requires a custom header (e.g. `X-Requested-With`) that a cross-site form or `<img>`/`<form>` CSRF attempt cannot attach — defense in depth alongside `SameSite=Strict`.
 - **Revocation**: wherever this document says a flow "invalidates the user's other active sessions" (§7.1a Forgot/Reset Password, §7.1b Change Password), that means revoking the corresponding rows in `refresh_tokens`. A stateless JWT access token can't be revoked before it expires on its own, so every session-termination guarantee in this document is backed by the refresh-token table, not the access token.
 - **Defense in depth**: a strict Content-Security-Policy (no `unsafe-inline`, no `unsafe-eval`) is applied SPA-wide to reduce the underlying XSS risk in the first place — the token-handling design above is what limits the damage _if_ that's ever bypassed, not a substitute for it.
+- **Where validation happens**: the API Gateway (§3.3) verifies the access token's signature and expiration on every request to a protected route, rejecting invalid or expired tokens before they reach `api`. That's authentication only — the gateway has no knowledge of the app's role model, so role-based authorization (§4) is still `api`'s responsibility.
+
+---
+
+## 3.3 API Gateway
+
+All client traffic — page loads and API calls alike — enters through a single **API Gateway** (§3.1) in front of both the `web` and `api` containers; neither is reachable directly (§11.2). The gateway is responsible for:
+
+- **TLS termination** and presenting one origin for the SPA and API — this is also what makes `SameSite` cookie enforcement on the refresh-token cookie (§3.2) meaningful rather than merely nominal.
+- **Rate limiting**: per-IP (and, once authenticated, per-user) request limits, applied most aggressively to `/api/auth/*` routes (login, register, forgot-password) to slow down credential-stuffing and brute-force attacks — this is complementary to, not a replacement for, the account-lockout mechanism in §7.1c.
+- **AuthN / token validation**: verifying the JWT access token's signature and expiration (§3.2) on every request to a non-public route, and rejecting invalid or expired tokens with `401` before they reach `api`. The verified caller identity (user id, role) is forwarded to `api` on an internal, trusted header, so `api` doesn't need to re-parse or re-verify the JWT itself — only read the identity and enforce role-based authorization (§4).
+
+Public routes (catalog browsing, `register`, `login`, `forgot-password`) skip the token-validation step but are still rate-limited.
+
+This can be a dedicated API gateway product (e.g. Kong, or a managed cloud gateway) or the same nginx/Traefik reverse proxy already terminating TLS, extended with a rate-limiting module and a JWT-validation module — the architectural requirement is the separation of concerns in front of `api`, not a specific product.
 
 ---
 
@@ -111,7 +131,7 @@ Storing a JWT somewhere the client-side JavaScript can read it (`localStorage`, 
 | **Admin**                 | Manage catalog (create/edit/delete widgets, set prices, manage inventory/stock), manage widget categories, view all orders (read-only), manage user role assignments                            |
 | **Customer Service (CS)** | View all orders and customers, issue refunds (full/partial) against an order/payment, process exchanges (accept returned item, ship replacement / adjust order), add internal notes to an order |
 
-Role checks are enforced **server-side** on every API endpoint — the SPA hides UI it shouldn't show, but the API is the actual authorization boundary.
+Role checks are enforced **server-side** on every API endpoint — the SPA hides UI it shouldn't show, but the API is the actual authorization boundary. Authentication (is this a valid, unexpired token?) is enforced upstream by the API Gateway (§3.3) before a request ever reaches `api`; authorization (is this role allowed to do this?) is enforced by `api` itself, since that's the only place the role model lives.
 
 Admin and CS accounts are internal/staff accounts, not self-service registrations — they're provisioned by an existing Admin.
 
@@ -387,6 +407,8 @@ This integration surface is intentionally modeled on how real gateways work (cli
 ---
 
 ## 7.7 Sequence Diagrams
+
+Every SPA→API call shown below passes through the API Gateway first (TLS termination, rate limiting, JWT validation — §3.3). It's omitted from each diagram since it doesn't change the business-level flow being illustrated, and is shown once in the architecture diagram (§3.1).
 
 ### 7.7.1 Registration / Login (§7.1)
 
@@ -784,7 +806,7 @@ Customer Service (customer_service only)
   PATCH  /api/cs/exchanges/:id
 ```
 
-All non-public endpoints require authentication; role-restricted endpoints additionally check `role` server-side.
+All requests reach this surface through the API Gateway (§3.3), which rate-limits every route and validates the access token on non-public ones before forwarding. All non-public endpoints require authentication; role-restricted endpoints additionally check `role` server-side.
 
 ---
 
@@ -807,7 +829,7 @@ All non-public endpoints require authentication; role-restricted endpoints addit
 
 ## 10. Non-Functional Requirements
 
-- **Security**: password hashing, parameterized SQL (no string-concatenated queries), server-side authZ on every endpoint, no raw card data at rest, HTTPS assumed in deployment. Password reset tokens are single-use, time-limited, stored hashed, and the forgot-password endpoint is rate-limited and returns a uniform response to avoid user enumeration. Login enforces account lockout after repeated failed attempts to slow down credential-stuffing/brute-force attacks. **Token theft**: the JWT access token is never persisted client-side (in-memory only, ~15 min lifetime); the refresh token that keeps the session alive is only ever exposed via an `HttpOnly`/`Secure`/`SameSite` cookie, is single-use with rotation, and reuse of an already-rotated refresh token revokes the whole session family as a theft signal (§3.2). A CSP restricting inline scripts limits the underlying XSS surface that this design assumes could otherwise be exploited.
+- **Security**: password hashing, parameterized SQL (no string-concatenated queries), server-side authZ on every endpoint, no raw card data at rest, HTTPS assumed in deployment. Password reset tokens are single-use, time-limited, stored hashed, and the forgot-password endpoint is rate-limited and returns a uniform response to avoid user enumeration. Login enforces account lockout after repeated failed attempts to slow down credential-stuffing/brute-force attacks, and the API Gateway (§3.3) rate-limits the same routes as a first line of defense in front of it. **Token theft**: the JWT access token is never persisted client-side (in-memory only, ~15 min lifetime); the refresh token that keeps the session alive is only ever exposed via an `HttpOnly`/`Secure`/`SameSite` cookie, is single-use with rotation, and reuse of an already-rotated refresh token revokes the whole session family as a theft signal (§3.2). A CSP restricting inline scripts limits the underlying XSS surface that this design assumes could otherwise be exploited. `api` is never directly reachable by clients — the gateway is the only public entry point and validates every access token before a request reaches it (§3.3, §11.2).
 - **Data integrity**: order line items and prices are immutable once an order is placed; catalog price changes never retroactively alter past orders.
 - **Auditability**: refunds and exchanges record the acting staff user, timestamp, and reason.
 - **Testability**: the payment processor client is implemented behind an interface/module boundary so it can be pointed at the processor's sandbox/test mode, or replaced with a test double, for local development and automated tests — this is a testing concern and does not change the production architecture, which always talks to the real processor.
@@ -820,23 +842,24 @@ The application ships as a small set of containers, defined via a `docker-compos
 
 ### 11.1 Containers
 
-| Service                        | Image / Base                         | Notes                                                                                                |
-| ------------------------------ | ------------------------------------ | ---------------------------------------------------------------------------------------------------- |
-| `web`                          | `node:XX-alpine` (multi-stage build) | Builds and serves the SPA (static build output served via nginx or a lightweight Node static server) |
-| `api`                          | `node:XX-alpine` (multi-stage build) | Express API server                                                                                   |
-| `db`                           | `postgres:XX-alpine`                 | SQL database, named volume for data persistence                                                      |
-| `migrate` (optional, one-shot) | same image as `api`                  | Runs DB migrations/seed on startup, then exits                                                       |
+| Service                        | Image / Base                         | Notes                                                                                                       |
+| ------------------------------ | ------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `gateway`                      | nginx/Traefik or a dedicated API gateway image | Sole publicly published container (§3.3): TLS termination, rate limiting, JWT authN/token validation |
+| `web`                          | `node:XX-alpine` (multi-stage build) | Builds and serves the SPA (static build output served via nginx or a lightweight Node static server); reachable only from `gateway` |
+| `api`                          | `node:XX-alpine` (multi-stage build) | Express API server; reachable only from `gateway`                                                          |
+| `db`                           | `postgres:XX-alpine`                 | SQL database, named volume for data persistence                                                            |
+| `migrate` (optional, one-shot) | same image as `api`                  | Runs DB migrations/seed on startup, then exits                                                             |
 
 The **payment processor is not a container in this Compose stack** — it is a real, external, third-party service reached over the public internet via HTTPS. Only `api` (server-to-server) and the browser running the SPA (for client-side tokenization) talk to it; nothing about it is deployed or operated by us.
 
 ### 11.2 Networking
 
 - A single Docker Compose network (or two: `frontend` and `backend`) so that:
-  - `web` is reachable from the host (published port, e.g. `80`/`443`).
-  - `api` is reachable from `web` and the host (for local dev), but in a hardened deployment only `web`/reverse-proxy would be published — `api` stays internal.
+  - `gateway` is the only container reachable from the host (published port, e.g. `80`/`443`).
+  - `web` and `api` are **not** published to the host; only `gateway` can reach them.
   - `db` is **not** published to the host; only `api` can reach it.
   - `api` requires outbound HTTPS access to the payment processor's public endpoints.
-- A reverse proxy (nginx/Traefik) container can front `web` + `api` under one origin to avoid CORS and to terminate TLS — this same one-origin setup is what makes `SameSite` cookie enforcement on the refresh-token cookie (§3.2) meaningful rather than merely nominal.
+- Presenting `web` and `api` under one origin via `gateway` also avoids CORS and is what makes `SameSite` cookie enforcement on the refresh-token cookie (§3.2) meaningful rather than merely nominal (§3.3).
 
 ### 11.3 Configuration & Secrets
 
@@ -859,9 +882,14 @@ The **payment processor is not a container in this Compose stack** — it is a r
 
 ```yaml
 services:
+  gateway:
+    build: ./gateway # nginx/Traefik config, or a dedicated gateway image
+    ports: ["8080:80", "8443:443"]
+    depends_on: [web, api]
+
   web:
     build: ./web
-    ports: ["8080:80"]
+    expose: ["80"]
     depends_on: [api]
 
   api:
@@ -897,7 +925,7 @@ _(The payment processor is external and has no service entry here — `api` reac
 ### 11.7 Deployment-Related Requirements
 
 1. The app must run end-to-end via a single `docker compose up` with no manual host setup beyond providing a `.env` (including payment processor credentials).
-2. `db` must not be exposed on host-published ports.
+2. `db`, `web`, and `api` must not be exposed on host-published ports — `gateway` is the sole published entry point.
 3. No secret values are baked into images; all are injected at runtime via env vars/secrets.
 4. Container images run as non-root and contain no dev-only tooling in the runtime stage.
 5. `api` must not accept traffic until database migrations have completed successfully.
